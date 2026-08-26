@@ -1,0 +1,7 @@
+.git
+bin/
+out/
+.env
+*.tgz
+package/
+README.md

@@ -1,0 +1,59 @@
+services:
+  db:
+    image: postgres:16-alpine
+    labels:
+      - io.portainer.accesscontrol.public
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-certtracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-certtracker}
+      POSTGRES_DB: ${POSTGRES_DB:-certtracker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-certtracker}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    # Exposed only for local inspection; remove in production.
+    # Host port 15432: 5433 already hosts another Postgres on the target box.
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+
+  app:
+    build: .
+    labels:
+      - io.portainer.accesscontrol.public
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Set here (not in .env) because it points at the compose service name.
+      DATABASE_URL: "postgres://${POSTGRES_USER:-certtracker}:${POSTGRES_PASSWORD:-certtracker}@db:5432/${POSTGRES_DB:-certtracker}?sslmode=disable"
+      # Pinned here so the published port below always matches what the app
+      # binds, even if .env sets a different HTTP_ADDR (environment wins over
+      # env_file). 8080 was already taken on the target host.
+      HTTP_ADDR: ":18090"
+    ports:
+      - "${HTTP_PORT:-18090}:18090"
+    restart: unless-stopped
+
+  # Optional local SMTP sink for testing email without a real relay.
+  # Start with:  docker compose --profile mailtest up
+  # Then set SMTP_HOST=mailhog and SMTP_PORT=1025 in .env (that port is
+  # container-to-container, so it stays 1025 regardless of the host mapping).
+  # Web UI at http://localhost:18025
+  mailhog:
+    image: mailhog/mailhog:latest
+    labels:
+      - io.portainer.accesscontrol.public
+    profiles: ["mailtest"]
+    ports:
+      - "18025:8025"
+      - "11025:1025"
+
+volumes:
+  pgdata:
+    labels:
+      - io.portainer.accesscontrol.public
