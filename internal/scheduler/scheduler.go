@@ -112,6 +112,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (int, error) {
 
 		alert := notify.Alert{
 			Kind:          d.kind,
+			ResourceKind:  c.Kind,
 			CertName:      c.Name,
 			Environment:   c.Environment,
 			DaysRemaining: c.DaysRemaining,
@@ -134,7 +135,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		s.log.Info("alert sent", "cert_id", c.ID, "name", c.Name,
-			"kind", d.kind, "trigger", d.trigger, "repeat_every_days", d.interval,
+			"resource_kind", c.Kind, "kind", d.kind, "trigger", d.trigger, "repeat_every_days", d.interval,
 			"days_remaining", c.DaysRemaining, "severity", c.Severity)
 		sent++
 	}

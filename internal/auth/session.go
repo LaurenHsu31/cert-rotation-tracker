@@ -80,6 +80,10 @@ type Identity struct {
 	UserID   int64
 	Username string
 	Role     string
+	// MustChangePassword freezes the account out of everything except signing
+	// out and choosing a new password. Carried on the identity so the check
+	// lives in one middleware rather than at the top of every handler.
+	MustChangePassword bool
 }
 
 func (i *Identity) IsAdmin() bool { return i != nil && i.Role == "admin" }

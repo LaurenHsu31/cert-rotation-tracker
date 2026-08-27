@@ -155,6 +155,7 @@ func (s *Store) CreateRenewal(r *models.Renewal, evidence []byte, actor Actor, i
 
 	if err := auditTx(tx, actor, ActionRenewalSubmit, "renewal", &id, map[string]any{
 		"certificate_id":  r.CertificateID,
+		"kind":            certKind(tx, r.CertificateID),
 		"new_expiry_date": models.DateOnly(r.NewExpiryDate),
 		"evidence_sha256": digest,
 		"evidence_bytes":  len(evidence),
@@ -209,17 +210,17 @@ func (s *Store) ApproveRenewal(id int64, note string, actor Actor) (*models.Rene
 	// Lock the certificate and confirm it is still live. Ownership is NOT
 	// required to review: a reviewer is deliberately a different person.
 	var (
-		name, env, webhook, notes string
-		days                      pq.Int64Array
-		emails                    pq.StringArray
-		ownerID                   sql.NullInt64
-		deletedAt, rotatedAt      sql.NullTime
+		name, kind, env, webhook, notes string
+		days                            pq.Int64Array
+		emails                          pq.StringArray
+		ownerID                         sql.NullInt64
+		deletedAt, rotatedAt            sql.NullTime
 	)
 	err = tx.QueryRow(
-		`SELECT name, environment, reminder_days, teams_webhook_url, notify_emails,
+		`SELECT name, kind, environment, reminder_days, teams_webhook_url, notify_emails,
 		        notes, owner_id, deleted_at, rotated_at
 		   FROM certificates WHERE id=$1 FOR UPDATE`, certID).
-		Scan(&name, &env, &days, &webhook, &emails, &notes, &ownerID, &deletedAt, &rotatedAt)
+		Scan(&name, &kind, &env, &days, &webhook, &emails, &notes, &ownerID, &deletedAt, &rotatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrNotFound
 	}
@@ -241,10 +242,10 @@ func (s *Store) ApproveRenewal(id int64, note string, actor Actor) (*models.Rene
 	var newCertID int64
 	if err := tx.QueryRow(
 		`INSERT INTO certificates
-		 (name, environment, issued_date, expiry_date, reminder_days,
+		 (name, kind, environment, issued_date, expiry_date, reminder_days,
 		  teams_webhook_url, notify_emails, notes, owner_id, renewed_from_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-		name, env, newIssued, newExpiry, days, webhook, emails, notes, ownerID, certID).
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+		name, kind, env, newIssued, newExpiry, days, webhook, emails, notes, ownerID, certID).
 		Scan(&newCertID); err != nil {
 		return nil, nil, err
 	}
@@ -263,8 +264,20 @@ func (s *Store) ApproveRenewal(id int64, note string, actor Actor) (*models.Rene
 		return nil, nil, err
 	}
 
+	// An open deletion request on a now-rotated certificate can never be
+	// actioned — the row is locked — so close it out rather than leaving it
+	// sitting in someone's review queue forever.
+	if _, err := tx.Exec(
+		`UPDATE deletion_requests
+		    SET status=$1, review_note='certificate was rotated'
+		  WHERE certificate_id=$2 AND status=$3`,
+		models.DeletionWithdrawn, certID, models.DeletionPending); err != nil {
+		return nil, nil, err
+	}
+
 	if err := auditTx(tx, actor, ActionRenewalApprove, "renewal", &id, map[string]any{
 		"certificate_id":     certID,
+		"kind":               kind,
 		"certificate_name":   name,
 		"new_certificate_id": newCertID,
 		"new_expiry_date":    models.DateOnly(newExpiry),
@@ -274,6 +287,7 @@ func (s *Store) ApproveRenewal(id int64, note string, actor Actor) (*models.Rene
 	}
 	if err := auditTx(tx, actor, ActionCertCreate, "certificate", &newCertID, map[string]any{
 		"name":            name,
+		"kind":            kind,
 		"environment":     env,
 		"expiry_date":     models.DateOnly(newExpiry),
 		"via":             "renewal",
@@ -321,6 +335,7 @@ func (s *Store) RejectRenewal(id int64, note string, actor Actor) (*models.Renew
 	}
 	if err := auditTx(tx, actor, ActionRenewalReject, "renewal", &id, map[string]any{
 		"certificate_id": certID,
+		"kind":           certKind(tx, certID),
 		"reason":         note,
 		"submitted_by":   submittedBy,
 	}); err != nil {
@@ -355,6 +370,7 @@ func (s *Store) WithdrawRenewal(id int64, actor Actor, isAdmin bool) (*models.Re
 	}
 	if err := auditTx(tx, actor, ActionRenewalWithdraw, "renewal", &id, map[string]any{
 		"certificate_id": certID,
+		"kind":           certKind(tx, certID),
 	}); err != nil {
 		return nil, err
 	}

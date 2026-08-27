@@ -40,11 +40,12 @@ func (s *Store) LookupSession(token string) (*models.User, error) {
 		disabled sql.NullTime
 	)
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.display_name, u.email, u.role, u.disabled_at
+		`SELECT u.id, u.username, u.display_name, u.email, u.role, u.disabled_at,
+		        u.must_change_password
 		   FROM sessions s JOIN users u ON u.id = s.user_id
 		  WHERE s.token_hash = $1 AND s.expires_at > now()`,
 		auth.HashToken(token),
-	).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Email, &u.Role, &disabled)
+	).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Email, &u.Role, &disabled, &u.MustChangePassword)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrSessionInvalid
 	}

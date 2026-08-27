@@ -217,6 +217,11 @@ input, select, textarea { font-family: inherit; }
   background: #eef1f4;
   color: var(--ink-soft);
 }
+/* The kind tag sits next to the environment tag, so it has to be readable as a
+   different axis of information — hence its own tint rather than another grey. */
+.tag.kind { background: #eef2ff; color: #3730a3; }
+.tag.kind.token { background: #f0fdfa; color: #115e59; }
+
 .sev-badge {
   font-size: 11px;
   font-weight: 700;
@@ -316,6 +321,7 @@ input, select, textarea { font-family: inherit; }
 }
 .empty h3 { color: var(--ink); margin: 0 0 6px; font-size: 18px; }
 .empty p { margin: 0 0 20px; }
+.empty-actions { display: flex; gap: 8px; justify-content: center; }
 
 /* ---------- modal ---------- */
 .overlay {
@@ -600,6 +606,10 @@ input, select, textarea { font-family: inherit; }
   box-shadow: var(--shadow);
 }
 .review-row.muted { opacity: .7; box-shadow: none; }
+/* A deletion request is the one review whose outcome removes something, so it
+   reads as a warning rather than as another item in a queue. */
+.review-row.danger { border-color: #fecaca; box-shadow: inset 3px 0 0 var(--sev-critical), var(--shadow); }
+.review-row .quote { margin-top: 6px; }
 .review-main { flex: 1; min-width: 0; }
 .review-name { font-weight: 650; display: flex; align-items: center; gap: 8px; }
 
@@ -919,6 +929,7 @@ input, select, textarea { font-family: inherit; }
   line-height: 1.35;
 }
 .ribbon.pending { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+.ribbon.danger  { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 
 .btn-accent { background: var(--brand); color: #fff; border-color: var(--brand); }
 .btn-accent:hover { background: var(--brand-ink); border-color: var(--brand-ink); }
@@ -980,11 +991,14 @@ input, select, textarea { font-family: inherit; }
 .life-pill.in_review { background: #fffbeb; color: #92400e; border-color: #fde68a; }
 .life-pill.rotated   { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
 .life-pill.deleted   { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+.life-pill.delete_review { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
 
-.card[data-sev] .ribbon.pending { display: flex; align-items: center; gap: 12px; }
+.card[data-sev] .ribbon.pending,
+.card[data-sev] .ribbon.danger { display: flex; align-items: center; gap: 12px; }
 .ribbon-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-weight: 400; }
 .ribbon-body strong { font-weight: 700; }
-.ribbon.pending .btn { flex: none; }
+.ribbon.pending .btn,
+.ribbon.danger .btn { flex: none; }
 
 /* ---------- audit log ---------- */
 .search {
@@ -1026,3 +1040,10 @@ input, select, textarea { font-family: inherit; }
   .disclosure { padding: 12px 14px; gap: 10px; }
   .disclosure-text .hint { display: none; }
 }
+
+/* ---------- sign-in extras ---------- */
+.login-foot a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.login-foot a:hover { text-decoration: underline; }
+.login-foot .sep { margin: 0 6px; color: var(--ink-faint); }
+.login-card .callout { margin-top: 16px; text-align: left; }
+.filter-label { color: var(--ink-faint); font-size: 13px; }

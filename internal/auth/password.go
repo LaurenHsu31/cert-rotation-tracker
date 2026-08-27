@@ -96,6 +96,39 @@ func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
 	return out[:keyLen]
 }
 
+// otpAlphabet leaves out the characters people misread when copying a code out
+// of an email: 0/O, 1/l/I. A shorter code that gets typed correctly beats a
+// longer one that gets retyped three times.
+const otpAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+// OTPLength gives ~64 bits of entropy over the alphabet above, which is far
+// more than the short expiry window and the one-per-cooldown rate limit need.
+const OTPLength = 13
+
+// NewOneTimePassword returns a random, human-transcribable temporary password,
+// grouped into blocks for legibility. Rejection sampling keeps the alphabet
+// uniform — a modulo bias here would shrink the search space for free.
+func NewOneTimePassword() (string, error) {
+	out := make([]byte, 0, OTPLength+3)
+	buf := make([]byte, 1)
+	max := byte(256 - (256 % len(otpAlphabet)))
+	for i := 0; i < OTPLength; i++ {
+		for {
+			if _, err := rand.Read(buf); err != nil {
+				return "", err
+			}
+			if buf[0] < max {
+				break
+			}
+		}
+		if i > 0 && i%4 == 0 {
+			out = append(out, '-')
+		}
+		out = append(out, otpAlphabet[int(buf[0])%len(otpAlphabet)])
+	}
+	return string(out), nil
+}
+
 // ValidatePasswordPolicy enforces the minimum the tracker will accept. Kept
 // deliberately simple: length does more for entropy than character classes.
 func ValidatePasswordPolicy(p string) error {

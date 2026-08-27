@@ -27,6 +27,24 @@ const (
 
 func ValidRole(r string) bool { return r == RoleAdmin || r == RoleUser }
 
+// Kinds of tracked secret. A certificate and an API/service token expire the
+// same way and need the same rotation discipline, so they share one table and
+// one workflow — the kind only changes the wording people see.
+const (
+	KindCertificate = "certificate"
+	KindToken       = "token"
+)
+
+func ValidKind(k string) bool { return k == KindCertificate || k == KindToken }
+
+// KindLabel is the capitalised noun used in notifications and headings.
+func KindLabel(k string) string {
+	if k == KindToken {
+		return "Token"
+	}
+	return "Certificate"
+}
+
 // Renewal request states.
 const (
 	RenewalPending   = "pending_review"
@@ -35,23 +53,43 @@ const (
 	RenewalWithdrawn = "withdrawn"
 )
 
+// Deletion request states. Same vocabulary as renewals — both are four-eyes
+// requests — but kept as their own constants so the two workflows can diverge
+// without a silent rename rippling through the other.
+const (
+	DeletionPending   = "pending_review"
+	DeletionApproved  = "approved"
+	DeletionRejected  = "rejected"
+	DeletionWithdrawn = "withdrawn"
+)
+
 // User is an account that can sign in. Password hashes never leave the store
 // layer, so there is no field for one here.
 type User struct {
-	ID          int64      `json:"id"`
-	Username    string     `json:"username"`
-	DisplayName string     `json:"display_name"`
-	Email       string     `json:"email"`
-	Role        string     `json:"role"`
-	Disabled    bool       `json:"disabled"`
-	DisabledAt  *time.Time `json:"disabled_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID          int64  `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	// Email is the login identifier as well as the address notifications and
+	// one-time passwords go to. Accounts created before it became the
+	// identifier may still have it empty and sign in by username.
+	Email      string     `json:"email"`
+	Role       string     `json:"role"`
+	Disabled   bool       `json:"disabled"`
+	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+
+	// MustChangePassword is set while the account is holding a one-time
+	// password (or one an administrator chose). Until it is cleared the API
+	// refuses everything except signing out and setting a new password.
+	MustChangePassword bool `json:"must_change_password"`
 }
 
 // Certificate is a tracked certificate and its reminder configuration.
 type Certificate struct {
-	ID           int64     `json:"id"`
-	Name         string    `json:"name"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// Kind is "certificate" or "token" — see KindCertificate/KindToken.
+	Kind         string    `json:"kind"`
 	Environment  string    `json:"environment"`
 	IssuedDate   time.Time `json:"issued_date"` // date only
 	ExpiryDate   time.Time `json:"expiry_date"` // date only
@@ -63,11 +101,12 @@ type Certificate struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 
 	// Ownership & lifecycle.
-	OwnerID       *int64     `json:"owner_id"`
-	OwnerUsername string     `json:"owner_username"`
-	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
-	RotatedAt     *time.Time `json:"rotated_at,omitempty"`
-	RenewedFromID *int64     `json:"renewed_from_id,omitempty"`
+	OwnerID        *int64     `json:"owner_id"`
+	OwnerUsername  string     `json:"owner_username"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+	DeletionReason string     `json:"deletion_reason,omitempty"`
+	RotatedAt      *time.Time `json:"rotated_at,omitempty"`
+	RenewedFromID  *int64     `json:"renewed_from_id,omitempty"`
 	// LastNotifiedOn is the calendar date an alert last went out, in the
 	// tracker's timezone. It drives the escalating reminder cadence.
 	LastNotifiedOn *time.Time `json:"last_notified_on,omitempty"`
@@ -83,6 +122,7 @@ type Certificate struct {
 	NotifyEmailCount  int    `json:"notify_email_count"`
 	Redacted          bool   `json:"redacted"`
 	PendingRenewalID  *int64 `json:"pending_renewal_id,omitempty"`
+	PendingDeletionID *int64 `json:"pending_deletion_id,omitempty"`
 	ReminderIntervalD int    `json:"reminder_interval_days"` // 0 = milestone-only, no repeat yet
 }
 
@@ -116,6 +156,30 @@ type Renewal struct {
 	CanWithdraw bool `json:"can_withdraw"`
 }
 
+// DeletionRequest is a request to remove a tracked certificate or token. Like
+// a Renewal it always carries a reason and always needs a second person, so no
+// single account can make a tracked secret disappear on its own.
+type DeletionRequest struct {
+	ID              int64      `json:"id"`
+	CertificateID   int64      `json:"certificate_id"`
+	CertificateName string     `json:"certificate_name"`
+	CertificateKind string     `json:"certificate_kind"`
+	Environment     string     `json:"environment"`
+	Status          string     `json:"status"`
+	Reason          string     `json:"reason"`
+	RequestedBy     int64      `json:"requested_by"`
+	RequestedByName string     `json:"requested_by_username"`
+	RequestedAt     time.Time  `json:"requested_at"`
+	ReviewedBy      *int64     `json:"reviewed_by,omitempty"`
+	ReviewedByName  string     `json:"reviewed_by_username,omitempty"`
+	ReviewedAt      *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNote      string     `json:"review_note"`
+
+	// Set per-viewer by the API layer (not stored):
+	CanReview   bool `json:"can_review"`
+	CanWithdraw bool `json:"can_withdraw"`
+}
+
 // AuditEntry is one immutable record of who did what.
 type AuditEntry struct {
 	ID         int64     `json:"id"`
@@ -143,6 +207,9 @@ func DaysUntil(date, now time.Time, loc *time.Location) int {
 
 // Enrich populates the computed fields (DaysRemaining, Severity, LifePercent).
 func (c *Certificate) Enrich(now time.Time, loc *time.Location, cuts severity.Cutoffs) {
+	if c.Kind == "" {
+		c.Kind = KindCertificate
+	}
 	c.DaysRemaining = DaysUntil(c.ExpiryDate, now, loc)
 	c.Severity = string(severity.Classify(c.DaysRemaining, cuts))
 	c.TeamsWebhookSet = c.TeamsWebhook != ""

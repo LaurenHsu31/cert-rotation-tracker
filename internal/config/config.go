@@ -54,6 +54,11 @@ type Config struct {
 	// Renewal evidence upload ceiling.
 	MaxUploadBytes int64
 
+	// Self-service password reset: how long a mailed one-time password stays
+	// usable, and how long before the same account may request another.
+	PasswordResetTTL      time.Duration
+	PasswordResetCooldown time.Duration
+
 	// SMTP (email channel). If SMTPHost is empty, email sending is disabled.
 	SMTPHost               string
 	SMTPPort               int
@@ -91,6 +96,9 @@ func Load() (*Config, error) {
 		BootstrapAdminPassword: getEnv("BOOTSTRAP_ADMIN_PASSWORD", ""),
 
 		MaxUploadBytes: int64(getInt("MAX_UPLOAD_MB", 5)) * 1024 * 1024,
+
+		PasswordResetTTL:      time.Duration(getInt("PASSWORD_RESET_TTL_MINUTES", 30)) * time.Minute,
+		PasswordResetCooldown: time.Duration(getInt("PASSWORD_RESET_COOLDOWN_SECONDS", 120)) * time.Second,
 
 		SMTPHost:               getEnv("SMTP_HOST", ""),
 		SMTPPort:               getInt("SMTP_PORT", 587),

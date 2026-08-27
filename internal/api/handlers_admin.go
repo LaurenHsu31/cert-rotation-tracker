@@ -49,6 +49,9 @@ func decodeUser(w http.ResponseWriter, r *http.Request) (*userInput, bool) {
 	return &in, true
 }
 
+// createUser registers an account against an email address. The address is the
+// login identifier; the username is only a readable handle for the audit log
+// and ownership chips, so it is derived rather than asked for.
 func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 	actor, _ := a.actor(r)
 	in, ok := decodeUser(w, r)
@@ -56,10 +59,9 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := store.NormalizeUsername(in.Username)
-	if !validUsername(username) {
-		writeError(w, http.StatusBadRequest,
-			"Username must be 3-32 characters: letters, digits, dot, dash or underscore")
+	email := store.NormalizeEmail(in.Email)
+	if !validEmail(email) {
+		writeError(w, http.StatusBadRequest, "A valid email address is required — it is the account's login")
 		return
 	}
 	if in.Role == "" {
@@ -74,13 +76,32 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := a.store.CreateUser(username, in.DisplayName, in.Email, in.Password, in.Role)
+	// An explicit username is still honoured so scripted provisioning can pin
+	// the handle; otherwise it comes from the address.
+	username := store.NormalizeUsername(in.Username)
+	if username == "" {
+		derived, derr := a.store.SuggestUsername(email)
+		if derr != nil {
+			a.serverError(w, "derive username", derr)
+			return
+		}
+		username = derived
+	}
+	if !validUsername(username) {
+		writeError(w, http.StatusBadRequest,
+			"Username must be 3-32 characters: letters, digits, dot, dash or underscore")
+		return
+	}
+
+	// mustChange=true: an administrator knows this password, so it is a
+	// handover credential and cannot stay in use.
+	u, err := a.store.CreateUser(username, in.DisplayName, email, in.Password, in.Role, true)
 	if err != nil {
 		a.storeError(w, "create user", err)
 		return
 	}
 	if err := a.store.Audit(actor, store.ActionUserCreate, "user", &u.ID,
-		map[string]any{"username": u.Username, "role": u.Role}); err != nil {
+		map[string]any{"username": u.Username, "email": u.Email, "role": u.Role}); err != nil {
 		a.log.Warn("audit create user", "error", err)
 	}
 	writeJSON(w, http.StatusCreated, u)
@@ -100,13 +121,18 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Role must be admin or user")
 		return
 	}
+	email := store.NormalizeEmail(in.Email)
+	if !validEmail(email) {
+		writeError(w, http.StatusBadRequest, "A valid email address is required — it is the account's login")
+		return
+	}
 	// Disabling yourself would end the very session making the request.
 	if id == actor.ID && in.Disabled {
 		writeError(w, http.StatusBadRequest, "You cannot disable your own account")
 		return
 	}
 
-	u, err := a.store.UpdateUser(id, in.DisplayName, in.Email, in.Role, in.Disabled)
+	u, err := a.store.UpdateUser(id, in.DisplayName, email, in.Role, in.Disabled)
 	if err != nil {
 		a.storeError(w, "update user", err)
 		return
@@ -141,7 +167,9 @@ func (a *API) resetUserPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := a.store.SetPassword(id, in.NewPassword, nil); err != nil {
+	// mustChange=true: the admin now knows this password, so the holder has to
+	// replace it at their next sign-in before the account can do anything.
+	if err := a.store.SetPassword(id, in.NewPassword, nil, true); err != nil {
 		a.storeError(w, "reset password", err)
 		return
 	}
@@ -190,6 +218,21 @@ func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// validEmail is a deliberately loose shape check. The address is proved by the
+// one-time password actually arriving, not by a regex, and over-strict local
+// rules reject real addresses.
+func validEmail(e string) bool {
+	if len(e) < 6 || len(e) > 254 || strings.ContainsAny(e, " \t\r\n,;") {
+		return false
+	}
+	at := strings.LastIndex(e, "@")
+	if at <= 0 || at == len(e)-1 {
+		return false
+	}
+	domain := e[at+1:]
+	return strings.Contains(domain, ".") && !strings.HasPrefix(domain, ".") && !strings.HasSuffix(domain, ".")
 }
 
 func validUsername(u string) bool {

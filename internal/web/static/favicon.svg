@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Rotation Tracker">
+  <!-- A solid brand tile rather than a bare glyph: at 16px in a tab strip or a
+       bookmarks bar, a filled shape with one high-contrast symbol inside stays
+       recognisable, while an outlined mark turns to mush. -->
+  <rect width="32" height="32" rx="7" fill="#4f46e5"/>
+  <g transform="translate(2.19 2.31) scale(1.15)">
+    <path d="M12 2.6 4.4 5.9v5.4c0 4.6 3.1 8.6 7.6 9.9 4.5-1.3 7.6-5.3 7.6-9.9V5.9L12 2.6Z" fill="#fff"/>
+    <path d="m8.3 12.2 2.6 2.6 4.8-5.2" fill="none" stroke="#4f46e5" stroke-width="2.6"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

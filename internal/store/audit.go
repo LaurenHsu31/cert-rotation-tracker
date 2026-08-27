@@ -22,13 +22,20 @@ const (
 	ActionRenewalApprove  = "renewal.approve"
 	ActionRenewalReject   = "renewal.reject"
 	ActionRenewalWithdraw = "renewal.withdraw"
-	ActionUserCreate      = "user.create"
-	ActionUserUpdate      = "user.update"
-	ActionUserPassword    = "user.password_change"
-	ActionLogin           = "auth.login"
-	ActionLoginFailed     = "auth.login_failed"
-	ActionLogout          = "auth.logout"
-	ActionRunCheck        = "task.run_check"
+	// Deletion is a reviewed request in its own right — the request, its
+	// verdict and the soft-delete it triggers are each recorded.
+	ActionDeletionRequest  = "deletion.request"
+	ActionDeletionApprove  = "deletion.approve"
+	ActionDeletionReject   = "deletion.reject"
+	ActionDeletionWithdraw = "deletion.withdraw"
+	ActionUserCreate       = "user.create"
+	ActionUserUpdate       = "user.update"
+	ActionUserPassword     = "user.password_change"
+	ActionPasswordReset    = "user.password_reset"
+	ActionLogin            = "auth.login"
+	ActionLoginFailed      = "auth.login_failed"
+	ActionLogout           = "auth.logout"
+	ActionRunCheck         = "task.run_check"
 )
 
 // AuditCategories groups actions into the buckets the UI filters by. Defined
@@ -39,7 +46,10 @@ var AuditCategories = map[string][]string{
 		ActionCertRestore, ActionCertTransfer, ActionCertTest},
 	"rotation": {ActionRenewalSubmit, ActionRenewalApprove,
 		ActionRenewalReject, ActionRenewalWithdraw},
-	"user":   {ActionUserCreate, ActionUserUpdate, ActionUserPassword},
+	"deletion": {ActionDeletionRequest, ActionDeletionApprove,
+		ActionDeletionReject, ActionDeletionWithdraw, ActionCertDelete,
+		ActionCertRestore},
+	"user":   {ActionUserCreate, ActionUserUpdate, ActionUserPassword, ActionPasswordReset},
 	"auth":   {ActionLogin, ActionLoginFailed, ActionLogout},
 	"system": {ActionRunCheck},
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -130,17 +131,18 @@ func (a *API) updateCertificate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
+// deleteCertificate no longer deletes anything. Removing a tracked certificate
+// or token needs a stated reason and a second person's approval, exactly like
+// rotating one — so the old one-click DELETE points callers at that workflow
+// rather than silently doing something different from what they asked for.
 func (a *API) deleteCertificate(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
-	actor, isAdmin := a.actor(r)
-	if err := a.store.DeleteCertificate(id, actor, isAdmin); err != nil {
-		a.storeError(w, "delete certificate", err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	writeError(w, http.StatusConflict, fmt.Sprintf(
+		"Deleting needs a reason and a second person's approval. "+
+			"Open a deletion request instead: POST /api/certificates/%d/deletions", id))
 }
 
 func (a *API) restoreCertificate(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +214,7 @@ func (a *API) testCertificate(w http.ResponseWriter, r *http.Request) {
 
 	alert := notify.Alert{
 		Kind:          "test",
+		ResourceKind:  c.Kind,
 		CertName:      c.Name,
 		Environment:   c.Environment,
 		DaysRemaining: c.DaysRemaining,
@@ -229,7 +232,7 @@ func (a *API) testCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.Audit(actor, store.ActionCertTest, "certificate", &c.ID,
-		map[string]any{"name": c.Name}); err != nil {
+		map[string]any{"name": c.Name, "kind": c.Kind}); err != nil {
 		a.log.Warn("audit test notification", "error", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -278,7 +281,10 @@ func (a *API) runCheck(w http.ResponseWriter, r *http.Request) {
 // ---------- input ----------
 
 type certInput struct {
-	Name            string   `json:"name"`
+	Name string `json:"name"`
+	// Kind is "certificate" or "token"; empty means certificate, so clients
+	// written before tokens existed keep working.
+	Kind            string   `json:"kind"`
 	Environment     string   `json:"environment"`
 	IssuedDate      string   `json:"issued_date"`
 	ExpiryDate      string   `json:"expiry_date"`
@@ -303,6 +309,13 @@ func (in *certInput) toCertificate(cfg cfgReader) (*models.Certificate, error) {
 	if name == "" {
 		return nil, errors.New("Name is required")
 	}
+	kind := strings.TrimSpace(in.Kind)
+	if kind == "" {
+		kind = models.KindCertificate
+	}
+	if !models.ValidKind(kind) {
+		return nil, errors.New("Type must be either certificate or token")
+	}
 	if !models.ValidEnvironment(in.Environment) {
 		return nil, errors.New("Environment must be one of dev, stg, prd")
 	}
@@ -313,6 +326,7 @@ func (in *certInput) toCertificate(cfg cfgReader) (*models.Certificate, error) {
 
 	return &models.Certificate{
 		Name:         name,
+		Kind:         kind,
 		Environment:  in.Environment,
 		IssuedDate:   issued,
 		ExpiryDate:   expiry,

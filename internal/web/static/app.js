@@ -18,21 +18,33 @@ const SEV_COLOR = {
   expired: "#7f1d1d",
 };
 
+// What is being tracked. Certificates and tokens both expire and both need
+// rotating, so they share every screen — the kind only changes the wording.
+const KINDS = [
+  { key: "certificate", label: "Certificate", plural: "Certificates" },
+  { key: "token",       label: "Token",       plural: "Tokens" },
+];
+
+function kindLabel(k) { return k === "token" ? "Token" : "Certificate"; }
+function kindLower(k) { return k === "token" ? "token" : "certificate"; }
+
 // Lifecycle states a certificate can be in, independent of how urgent its
 // expiry is. Severity answers "how long have I got"; this answers "what is
 // happening to it right now".
 const LIFECYCLE = {
-  deleted:   { label: "Deleted",   hint: "Soft-deleted — an administrator can restore it" },
-  rotated:   { label: "Rotated",   hint: "Replaced by a newer certificate; no longer alerting" },
-  in_review: { label: "In review", hint: "A rotation was submitted and is waiting for a second person" },
-  active:    { label: "Active",    hint: "Being tracked and alerted on" },
+  deleted:       { label: "Deleted",            hint: "Soft-deleted — an administrator can restore it" },
+  rotated:       { label: "Rotated",            hint: "Replaced by a newer one; no longer alerting" },
+  in_review:     { label: "Rotation in review", hint: "A rotation was submitted and is waiting for a second person" },
+  delete_review: { label: "Deletion in review", hint: "A deletion was requested and is waiting for a second person" },
+  active:        { label: "Active",             hint: "Being tracked and alerted on" },
 };
 
 // Audit action → the label and colour bucket shown in the log.
 const AUDIT_TABS = [
   { key: "all",         label: "All" },
-  { key: "certificate", label: "Certificates" },
+  { key: "certificate", label: "Changes" },
   { key: "rotation",    label: "Rotations" },
+  { key: "deletion",    label: "Deletions" },
   { key: "user",        label: "Users" },
   { key: "auth",        label: "Sign-in" },
   { key: "system",      label: "System" },
@@ -49,9 +61,14 @@ const ACTION_LABEL = {
   "renewal.approve": "Renewal approved",
   "renewal.reject": "Renewal rejected",
   "renewal.withdraw": "Renewal withdrawn",
+  "deletion.request": "Deletion requested",
+  "deletion.approve": "Deletion approved",
+  "deletion.reject": "Deletion refused",
+  "deletion.withdraw": "Deletion withdrawn",
   "user.create": "User created",
   "user.update": "User updated",
   "user.password_change": "Password changed",
+  "user.password_reset": "One-time password sent",
   "auth.login": "Signed in",
   "auth.login_failed": "Sign-in failed",
   "auth.logout": "Signed out",
@@ -65,12 +82,17 @@ const ACTION_TONE = {
   "certificate.restore": "good",
   "renewal.approve": "good",
   "certificate.delete": "bad",
+  "deletion.approve": "bad",
   "renewal.reject": "bad",
   "auth.login_failed": "bad",
+  "deletion.reject": "good",
   "renewal.submit": "warn",
   "renewal.withdraw": "warn",
+  "deletion.request": "warn",
+  "deletion.withdraw": "warn",
   "certificate.transfer_owner": "warn",
   "user.password_change": "warn",
+  "user.password_reset": "warn",
 };
 
 // Thrown when the server says the session is gone, so callers can bounce the
@@ -139,12 +161,30 @@ createApp({
     const loginError = ref("");
     const loggingIn = ref(false);
 
+    // Forgot-password: a small panel on the login card rather than a route, so
+    // a signed-out person never leaves the screen they are stuck on.
+    const forgotOpen = ref(false);
+    const forgotEmail = ref("");
+    const forgotError = ref("");
+    const forgotSent = ref(false);
+    const forgotBusy = ref(false);
+
+    // Set when the account is signed in but holding a one-time password. The
+    // API refuses everything else until it is cleared, so the UI must not offer
+    // anything else either.
+    const mustChangePassword = ref(false);
+    const firstPasswordForm = reactive({ current_password: "", new_password: "", confirm: "" });
+    const firstPasswordError = ref("");
+    const firstPasswordBusy = ref(false);
+
     const isAdmin = computed(() => !!me.value && me.value.role === "admin");
     const signedIn = computed(() => !!me.value);
+    const resetMinutes = computed(() => (config.value && config.value.password_reset_minutes) || 30);
 
     // ---------- data ----------
     const certs = ref([]);
     const renewals = ref([]);
+    const deletions = ref([]);
     const users = ref([]);
     const auditEntries = ref([]);
     const config = ref(null);
@@ -152,8 +192,10 @@ createApp({
 
     const view = ref("certs"); // certs | reviews | audit | users
     const auditCategory = ref("all");
+    const auditKind = ref("all");
     const auditSearch = ref("");
     const filterEnv = ref("all");
+    const filterKind = ref("all");
     const filterSev = ref(null);
     const showRotated = ref(false);
     const showDeleted = ref(false);
@@ -187,6 +229,17 @@ createApp({
     // attributes, so binding the bare string would disable the buttons forever.
     const reviewBusy = ref("");
 
+    // Deleting is a request, not a click: a reason goes in here, and a second
+    // person approves it in deleteReviewModal.
+    const deleteModal = ref(null); // the cert being proposed for deletion
+    const deleteReason = ref("");
+    const deleteError = ref("");
+    const deleteSaving = ref(false);
+
+    const deleteReviewModal = ref(null); // the deletion request being reviewed
+    const deleteReviewNote = ref("");
+    const deleteReviewBusy = ref(""); // "" | "approve" | "reject"
+
     const ownerModal = ref(null);
     const ownerTarget = ref(null);
 
@@ -204,6 +257,7 @@ createApp({
     function blankForm() {
       return {
         name: "",
+        kind: "certificate",
         environment: "prd",
         issued_date: todayStr(),
         expiry_date: "",
@@ -218,6 +272,7 @@ createApp({
     const environments = computed(() =>
       config.value ? config.value.environments : ["dev", "stg", "prd"]
     );
+    const kinds = computed(() => (config.value && config.value.kinds) || ["certificate", "token"]);
     const reminderOptions = computed(() =>
       config.value ? config.value.reminder_options : [30, 45, 60, 75, 90]
     );
@@ -232,9 +287,10 @@ createApp({
     const deletedCerts = computed(() => certs.value.filter((c) => !!c.deleted_at));
 
     const envCerts = computed(() =>
-      filterEnv.value === "all"
-        ? activeCerts.value
-        : activeCerts.value.filter((c) => c.environment === filterEnv.value)
+      activeCerts.value.filter((c) =>
+        (filterEnv.value === "all" || c.environment === filterEnv.value) &&
+        (filterKind.value === "all" || (c.kind || "certificate") === filterKind.value)
+      )
     );
     const counts = computed(() => {
       const m = {};
@@ -250,6 +306,13 @@ createApp({
     // own submissions never show up here.
     const myReviewQueue = computed(() => pendingRenewals.value.filter((r) => r.can_review));
     const awaitingOthers = computed(() => pendingRenewals.value.filter((r) => !r.can_review));
+
+    const pendingDeletions = computed(() => deletions.value.filter((d) => d.status === "pending_review"));
+    const myDeletionQueue = computed(() => pendingDeletions.value.filter((d) => d.can_review));
+    const awaitingDeletionOthers = computed(() => pendingDeletions.value.filter((d) => !d.can_review));
+    // One badge on the Reviews tab covers both queues — from the reviewer's
+    // side "something is waiting for me" is one fact, not two.
+    const reviewQueueCount = computed(() => myReviewQueue.value.length + myDeletionQueue.value.length);
 
     const activeUsers = computed(() => users.value.filter((u) => !u.disabled));
 
@@ -278,9 +341,17 @@ createApp({
       return renewals.value.find((r) => r.id === c.pending_renewal_id) || null;
     }
 
+    function pendingDeletionFor(c) {
+      if (!c.pending_deletion_id) return null;
+      return deletions.value.find((d) => d.id === c.pending_deletion_id) || null;
+    }
+
     function lifecycleKey(c) {
       if (c.deleted_at) return "deleted";
       if (c.rotated_at) return "rotated";
+      // A pending deletion outranks a pending rotation in the UI: it is the
+      // one that ends with the certificate gone.
+      if (c.pending_deletion_id) return "delete_review";
       if (c.pending_renewal_id) return "in_review";
       return "active";
     }
@@ -329,8 +400,10 @@ createApp({
         const s = await request("GET", "/api/auth/session");
         authEnabled.value = s.auth_enabled;
         me.value = s.authenticated ? s.user : null;
+        mustChangePassword.value = !!(me.value && me.value.must_change_password);
       } catch (e) {
         me.value = null;
+        mustChangePassword.value = false;
       }
     }
 
@@ -347,6 +420,18 @@ createApp({
           password: loginForm.password,
         });
         me.value = r.user;
+        mustChangePassword.value = !!r.user.must_change_password;
+        if (mustChangePassword.value) {
+          // Carry the one-time password over so the forced-change form can
+          // prove the account without asking for it a second time.
+          firstPasswordForm.current_password = loginForm.password;
+          firstPasswordForm.new_password = "";
+          firstPasswordForm.confirm = "";
+          firstPasswordError.value = "";
+          loginForm.password = "";
+          await loadConfig();
+          return;
+        }
         loginForm.password = "";
         await loadAll();
       } catch (e) {
@@ -356,11 +441,79 @@ createApp({
       }
     }
 
+    async function requestReset() {
+      forgotError.value = "";
+      const email = forgotEmail.value.trim();
+      if (!email || !email.includes("@")) {
+        forgotError.value = "Enter the email address for your account.";
+        return;
+      }
+      forgotBusy.value = true;
+      try {
+        await request("POST", "/api/auth/forgot", { email });
+        forgotSent.value = true;
+      } catch (e) {
+        forgotError.value = e.message;
+      } finally {
+        forgotBusy.value = false;
+      }
+    }
+
+    function openForgot() {
+      forgotOpen.value = true;
+      forgotSent.value = false;
+      forgotError.value = "";
+      forgotEmail.value = loginForm.username.trim();
+    }
+
+    function closeForgot() {
+      forgotOpen.value = false;
+      forgotSent.value = false;
+      forgotError.value = "";
+    }
+
+    // The forced first change. It reuses the ordinary change-password endpoint,
+    // which is the one route a frozen account may still reach.
+    async function submitFirstPassword() {
+      firstPasswordError.value = "";
+      if (firstPasswordForm.new_password !== firstPasswordForm.confirm) {
+        firstPasswordError.value = "The two passwords do not match.";
+        return;
+      }
+      if ((firstPasswordForm.new_password || "").length < 10) {
+        firstPasswordError.value = "New password must be at least 10 characters.";
+        return;
+      }
+      if (firstPasswordForm.new_password === firstPasswordForm.current_password) {
+        firstPasswordError.value = "Choose something other than the one-time password you were sent.";
+        return;
+      }
+      firstPasswordBusy.value = true;
+      try {
+        await request("POST", "/api/auth/password", {
+          current_password: firstPasswordForm.current_password,
+          new_password: firstPasswordForm.new_password,
+        });
+        mustChangePassword.value = false;
+        if (me.value) me.value.must_change_password = false;
+        firstPasswordForm.current_password = firstPasswordForm.new_password = firstPasswordForm.confirm = "";
+        toast("Password set. Welcome in.", "ok");
+        await loadAll();
+      } catch (e) {
+        if (e instanceof Unauthorized) { me.value = null; mustChangePassword.value = false; return; }
+        firstPasswordError.value = e.message;
+      } finally {
+        firstPasswordBusy.value = false;
+      }
+    }
+
     async function doLogout() {
       try { await request("POST", "/api/auth/logout"); } catch (e) { /* falling through logs out locally anyway */ }
       me.value = null;
+      mustChangePassword.value = false;
       certs.value = [];
       renewals.value = [];
+      deletions.value = [];
       users.value = [];
       auditEntries.value = [];
       view.value = "certs";
@@ -414,6 +567,10 @@ createApp({
       await guard(async () => { renewals.value = await request("GET", "/api/renewals"); });
     }
 
+    async function loadDeletions() {
+      await guard(async () => { deletions.value = await request("GET", "/api/deletions"); });
+    }
+
     async function loadUsers() {
       await guard(async () => { users.value = await request("GET", "/api/users"); });
     }
@@ -433,20 +590,34 @@ createApp({
       await loadAudit();
     }
 
-    // Free-text narrowing on top of the category, applied locally.
+    // Entries that are about a tracked item record its type. Ones that are not
+    // (sign-ins, user admin, the scheduler) have no type and are therefore only
+    // ever shown under "All types" — filtering by type means "show me what
+    // happened to tokens", and a sign-in is not that.
+    function entryKind(e) {
+      const d = e.detail || {};
+      if (d.kind) return d.kind;
+      if (e.entity_type === "certificate" || e.entity_type === "renewal" || e.entity_type === "deletion") {
+        return "certificate"; // recorded before tokens existed
+      }
+      return null;
+    }
+
+    // Type and free-text narrowing on top of the category, applied locally.
     const visibleAudit = computed(() => {
       const q = auditSearch.value.trim().toLowerCase();
-      if (!q) return auditEntries.value;
-      return auditEntries.value.filter((e) =>
-        (e.actor || "").toLowerCase().includes(q) ||
-        actionLabel(e.action).toLowerCase().includes(q) ||
-        describeEntry(e).toLowerCase().includes(q)
-      );
+      return auditEntries.value.filter((e) => {
+        if (auditKind.value !== "all" && entryKind(e) !== auditKind.value) return false;
+        if (!q) return true;
+        return (e.actor || "").toLowerCase().includes(q) ||
+          actionLabel(e.action).toLowerCase().includes(q) ||
+          describeEntry(e).toLowerCase().includes(q);
+      });
     });
 
     async function loadAll() {
       await loadConfig();
-      await Promise.all([loadCerts(), loadRenewals(), loadUsers()]);
+      await Promise.all([loadCerts(), loadRenewals(), loadDeletions(), loadUsers()]);
       if (isAdmin.value) await loadAudit();
     }
 
@@ -454,7 +625,7 @@ createApp({
       view.value = v;
       if (v === "audit") loadAudit();
       if (v === "users") loadUsers();
-      if (v === "reviews") loadRenewals();
+      if (v === "reviews") { loadRenewals(); loadDeletions(); }
     }
 
     function toggleSevFilter(key) {
@@ -467,8 +638,9 @@ createApp({
     }
 
     // ---------- certificate CRUD ----------
-    function openCreate() {
+    function openCreate(kind) {
       const d = blankForm();
+      d.kind = kind || "certificate";
       if (config.value) d.reminder_days = config.value.reminder_default_days.slice();
       Object.assign(form, d);
       editing.value = null;
@@ -479,6 +651,7 @@ createApp({
     function openEdit(c) {
       Object.assign(form, {
         name: c.name,
+        kind: c.kind || "certificate",
         environment: c.environment,
         issued_date: c.issued_date.slice(0, 10),
         expiry_date: c.expiry_date.slice(0, 10),
@@ -507,6 +680,7 @@ createApp({
 
       const payload = {
         name: form.name.trim(),
+        kind: form.kind,
         environment: form.environment,
         issued_date: form.issued_date,
         expiry_date: form.expiry_date,
@@ -523,7 +697,7 @@ createApp({
           toast("Changes saved.", "ok");
         } else {
           await request("POST", "/api/certificates", payload);
-          toast("Certificate added.", "ok");
+          toast(kindLabel(form.kind) + " added.", "ok");
         }
         showModal.value = false;
         await loadCerts();
@@ -535,19 +709,93 @@ createApp({
       }
     }
 
-    async function deleteCert(c) {
-      if (!confirm('Delete "' + c.name + '"?\n\nIt is hidden but recoverable — an administrator can restore it.')) return;
+    // ---------- deletion requests ----------
+    function openDelete(c) {
+      deleteModal.value = c;
+      deleteReason.value = "";
+      deleteError.value = "";
+    }
+
+    async function submitDeletion() {
+      const c = deleteModal.value;
+      if (!c) return;
+      deleteError.value = "";
+      if (!deleteReason.value.trim()) {
+        deleteError.value = "Say why this should be deleted — the reviewer and the notified team read it.";
+        return;
+      }
+      deleteSaving.value = true;
+      try {
+        await request("POST", "/api/certificates/" + c.id + "/deletions", { reason: deleteReason.value.trim() });
+        deleteModal.value = null;
+        toast("Deletion requested. It needs a second person to approve it.", "ok");
+        await Promise.all([loadCerts(), loadDeletions()]);
+      } catch (e) {
+        if (e instanceof Unauthorized) { me.value = null; return; }
+        deleteError.value = e.message;
+      } finally {
+        deleteSaving.value = false;
+      }
+    }
+
+    function openDeleteReview(d) {
+      deleteReviewModal.value = d;
+      deleteReviewNote.value = "";
+    }
+
+    async function approveDeletion() {
+      const d = deleteReviewModal.value;
+      if (!d) return;
+      if (!confirm("Approve this deletion?\n\n" + d.certificate_name +
+        "\nIt stops alerting and everyone on its notification channels is told. " +
+        "An administrator can still restore it.")) return;
+      deleteReviewBusy.value = "approve";
       await guard(async () => {
-        await request("DELETE", "/api/certificates/" + c.id);
-        toast("Certificate deleted. An administrator can restore it.", "ok");
-        await loadCerts();
+        const r = await request("POST", "/api/deletions/" + d.id + "/approve", { note: deleteReviewNote.value.trim() });
+        deleteReviewModal.value = null;
+        const n = r && r.notification;
+        if (n && n.sent) toast("Deleted. Notification sent to the configured channels.", "ok");
+        else if (n && n.errors) toast("Deleted, but the notification failed: " + n.errors.join("; "), "err");
+        else toast("Deleted. No notification channel was configured, so nobody was told.", "ok");
+        await Promise.all([loadCerts(), loadDeletions(), loadAudit()]);
       });
+      deleteReviewBusy.value = "";
+    }
+
+    async function rejectDeletion() {
+      const d = deleteReviewModal.value;
+      if (!d) return;
+      if (!deleteReviewNote.value.trim()) {
+        toast("Give a reason so the requester knows why this was refused.", "err");
+        return;
+      }
+      deleteReviewBusy.value = "reject";
+      await guard(async () => {
+        await request("POST", "/api/deletions/" + d.id + "/reject", { note: deleteReviewNote.value.trim() });
+        deleteReviewModal.value = null;
+        toast("Deletion refused. Nothing was removed.", "ok");
+        await Promise.all([loadCerts(), loadDeletions(), loadAudit()]);
+      });
+      deleteReviewBusy.value = "";
+    }
+
+    async function withdrawDeletion(d) {
+      if (!confirm("Withdraw this deletion request?")) return;
+      await guard(async () => {
+        await request("POST", "/api/deletions/" + d.id + "/withdraw");
+        toast("Request withdrawn.", "ok");
+        await Promise.all([loadCerts(), loadDeletions()]);
+      });
+    }
+
+    function deletionsFor(certID) {
+      return deletions.value.filter((d) => d.certificate_id === certID);
     }
 
     async function restoreCert(c) {
       await guard(async () => {
         await request("POST", "/api/certificates/" + c.id + "/restore");
-        toast("Certificate restored.", "ok");
+        toast(kindLabel(c.kind) + " restored.", "ok");
         await loadCerts();
       });
     }
@@ -709,14 +957,14 @@ createApp({
       const d = e.detail || {};
       switch (e.action) {
         case "certificate.create":
-          return d.via === "renewal"
-            ? "Created as the replacement for #" + d.renewed_from_id + ", expiring " + d.expiry_date
-            : "Created, expiring " + d.expiry_date;
+          return (d.via === "renewal"
+            ? kindLabel(d.kind) + " created as the replacement for #" + d.renewed_from_id + ", expiring " + d.expiry_date
+            : kindLabel(d.kind) + " created, expiring " + d.expiry_date);
         case "certificate.update":
           return d.expiry_changed
             ? "Updated — expiry moved from " + d.prev_expiry + " to " + d.expiry_date + " (reminders re-armed)"
             : "Updated settings";
-        case "certificate.delete": return "Deleted";
+        case "certificate.delete": return "Deleted after review — reason: " + (d.reason || "not recorded");
         case "certificate.restore": return "Restored";
         case "certificate.transfer_owner": return "Owner changed to " + d.new_owner;
         case "certificate.test_notification": return "Sent a test notification";
@@ -724,9 +972,14 @@ createApp({
         case "renewal.approve": return "Renewal approved — replacement is #" + d.new_certificate_id;
         case "renewal.reject": return "Renewal rejected: " + (d.reason || "");
         case "renewal.withdraw": return "Renewal withdrawn";
-        case "user.create": return "Created user " + d.username + " (" + d.role + ")";
+        case "deletion.request": return "Deletion requested: " + (d.reason || "");
+        case "deletion.approve": return "Deletion approved — " + (d.certificate_name || "") + " removed, reason: " + (d.reason || "");
+        case "deletion.reject": return "Deletion refused: " + (d.review_note || "");
+        case "deletion.withdraw": return "Deletion request withdrawn";
+        case "user.create": return "Created user " + (d.email || d.username) + " (" + d.role + ")";
         case "user.update": return "Updated user " + d.username + " — role " + d.role + (d.disabled ? ", disabled" : "");
         case "user.password_change": return d.self_service ? "Changed their own password" : "Password reset by an administrator";
+        case "user.password_reset": return "A one-time password was mailed to them after a forgotten-password request from " + (d.remote || "unknown");
         case "auth.login": return "Signed in from " + (d.remote || "unknown");
         case "auth.login_failed": return "Failed sign-in from " + (d.remote || "unknown");
         case "auth.logout": return "Signed out";
@@ -754,14 +1007,20 @@ createApp({
     async function submitUser() {
       userError.value = "";
       const m = userModal.value;
+      if (!userForm.email.trim().includes("@")) {
+        userError.value = "An email address is required — it is the account's login.";
+        return;
+      }
       try {
         if (m.mode === "create") {
           await request("POST", "/api/users", {
-            username: userForm.username, display_name: userForm.display_name,
+            // The handle is derived from the address server-side; sending it
+            // empty is what asks for that.
+            username: "", display_name: userForm.display_name,
             email: userForm.email, password: userForm.password,
             role: userForm.role, disabled: false,
           });
-          toast("User created.", "ok");
+          toast("User created. They must set their own password at first sign-in.", "ok");
         } else {
           await request("PUT", "/api/users/" + m.id, {
             username: userForm.username, display_name: userForm.display_name,
@@ -778,18 +1037,20 @@ createApp({
     }
 
     async function resetUserPassword(u) {
-      const pw = prompt('New password for "' + u.username + '" (at least 10 characters).\nEvery session for this account will be signed out.');
+      const pw = prompt('Temporary password for "' + (u.email || u.username) + '" (at least 10 characters).\n\nEvery session for this account is signed out, and they must choose their own password at their next sign-in.');
       if (!pw) return;
       await guard(async () => {
         await request("POST", "/api/users/" + u.id + "/password", { new_password: pw });
-        toast("Password reset for " + u.username + ".", "ok");
+        toast("Temporary password set for " + (u.email || u.username) + ".", "ok");
+        await loadUsers();
       });
     }
 
     onMounted(async () => {
       document.addEventListener("click", closeMenu);
       await loadSession();
-      if (me.value) await loadAll();
+      if (me.value && mustChangePassword.value) await loadConfig();
+      else if (me.value) await loadAll();
       booting.value = false;
     });
 
@@ -797,22 +1058,32 @@ createApp({
       // session
       booting, authEnabled, me, isAdmin, signedIn, loginForm, loginError, loggingIn,
       doLogin, doLogout, passwordModal, passwordForm, passwordError, submitPassword,
+      forgotOpen, forgotEmail, forgotError, forgotSent, forgotBusy,
+      openForgot, closeForgot, requestReset, resetMinutes,
+      mustChangePassword, firstPasswordForm, firstPasswordError, firstPasswordBusy,
+      submitFirstPassword,
       // data
-      certs, renewals, users, auditEntries, config, loading, view, switchView,
+      certs, renewals, deletions, users, auditEntries, config, loading, view, switchView,
       menu, toggleMenu, closeMenu, initials,
-      auditCategory, auditSearch, visibleAudit, setAuditCategory,
+      auditCategory, auditKind, auditSearch, visibleAudit, setAuditCategory, entryKind,
       auditTabs: AUDIT_TABS, actionLabel, actionTone,
-      lifecycle, lifecycleKey, pendingRenewalFor,
-      filterEnv, filterSev, showRotated, showDeleted, toggleDeleted, toasts,
-      environments, reminderOptions, emailEnabled, escalation, maxUploadMB,
+      lifecycle, lifecycleKey, pendingRenewalFor, pendingDeletionFor,
+      filterEnv, filterKind, filterSev, showRotated, showDeleted, toggleDeleted, toasts,
+      environments, kinds, kindLabel, kindLower, kindOptions: KINDS,
+      reminderOptions, emailEnabled, escalation, maxUploadMB,
       activeCerts, rotatedCerts, deletedCerts, envCerts, counts, filteredCerts,
       pendingRenewals, myReviewQueue, awaitingOthers, activeUsers,
+      pendingDeletions, myDeletionQueue, awaitingDeletionOthers, reviewQueueCount,
       severities: SEVERITIES, sevColor, sevLabel, cadenceText, statusLabel,
       fmtDateTime, fmtBytes,
       // certs
       showModal, editing, saving, formError, form,
       openCreate, openEdit, closeModal, toggleDay, submitForm,
-      deleteCert, restoreCert, testCert, runCheck, toggleSevFilter,
+      restoreCert, testCert, runCheck, toggleSevFilter,
+      // deletion requests
+      deleteModal, deleteReason, deleteError, deleteSaving, openDelete, submitDeletion,
+      deleteReviewModal, deleteReviewNote, deleteReviewBusy, openDeleteReview,
+      approveDeletion, rejectDeletion, withdrawDeletion, deletionsFor,
       // owner
       ownerModal, ownerTarget, openOwner, submitOwner,
       // renewal
@@ -841,7 +1112,7 @@ createApp({
         </svg>
       </div>
       <h2>Certificate Rotation Tracker</h2>
-      <p class="pitch-lede">Know how much runway every certificate has left — and never let one expire unnoticed.</p>
+      <p class="pitch-lede">Know how much runway every certificate and token has left — and never let one expire unnoticed.</p>
       <ul class="pitch-list">
         <li>
           <strong>Escalating reminders</strong>
@@ -849,17 +1120,17 @@ createApp({
         </li>
         <li>
           <strong>Owner-scoped changes</strong>
-          Only the owner and administrators can edit a certificate. Everyone else reads, with credentials redacted.
+          Only the owner and administrators can edit an entry. Everyone else reads, with credentials redacted.
         </li>
         <li>
-          <strong>Four-eyes rotation</strong>
-          Marking a certificate renewed needs proof and a second person's approval.
+          <strong>Four eyes on rotation and deletion</strong>
+          Marking something renewed needs proof; deleting it needs a reason. Both need a second person.
         </li>
       </ul>
     </aside>
 
     <div class="login-panel">
-      <form class="login-card" @submit.prevent="doLogin">
+      <form v-if="!forgotOpen" class="login-card" @submit.prevent="doLogin">
         <div class="mark mark-sm login-mark">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M12 2.6 4.4 5.9v5.4c0 4.6 3.1 8.6 7.6 9.9 4.5-1.3 7.6-5.3 7.6-9.9V5.9L12 2.6Z"
@@ -869,23 +1140,137 @@ createApp({
           </svg>
         </div>
         <h1>Sign in</h1>
-        <p class="sub">Use your tracker account to continue.</p>
+        <p class="sub">Your email address is your account.</p>
 
         <div v-if="loginError" class="form-error">{{ loginError }}</div>
 
         <div class="field">
-          <label for="lg-user">Username</label>
-          <input id="lg-user" type="text" v-model="loginForm.username" autocomplete="username" autofocus />
+          <label for="lg-user">Email</label>
+          <input id="lg-user" type="text" inputmode="email" v-model="loginForm.username"
+                 autocomplete="username" placeholder="you@example.com" autofocus />
         </div>
         <div class="field">
           <label for="lg-pass">Password</label>
           <input id="lg-pass" type="password" v-model="loginForm.password" autocomplete="current-password" />
+          <span class="hint">Sent a one-time password? Use it here — you will set a real one next.</span>
         </div>
         <button class="btn btn-primary btn-block" type="submit" :disabled="loggingIn">
           {{ loggingIn ? 'Signing in…' : 'Sign in' }}
         </button>
         <p class="login-foot">
+          <a href="#" @click.prevent="openForgot">Forgot your password?</a>
+          <span class="sep">·</span>
           No account yet? An administrator creates one for you.
+        </p>
+      </form>
+
+      <form v-else class="login-card" @submit.prevent="requestReset">
+        <div class="mark mark-sm login-mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2.6 4.4 5.9v5.4c0 4.6 3.1 8.6 7.6 9.9 4.5-1.3 7.6-5.3 7.6-9.9V5.9L12 2.6Z"
+                  stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="m8.6 12.1 2.4 2.4 4.4-4.8" stroke="currentColor" stroke-width="1.8"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+
+        <template v-if="forgotSent">
+          <h1>Check your inbox</h1>
+          <p class="sub">
+            If <strong>{{ forgotEmail }}</strong> has an account, a one-time password is on its way.
+            It works once, expires in {{ resetMinutes }} minutes, and you will be asked to set a
+            real password as soon as you sign in with it.
+          </p>
+          <div class="callout">
+            Your old password stopped working the moment the one-time password went out — that is
+            what makes it safe to send.
+          </div>
+          <button class="btn btn-primary btn-block" type="button" @click="closeForgot">Back to sign in</button>
+        </template>
+
+        <template v-else>
+          <h1>Forgot your password?</h1>
+          <p class="sub">We will email a one-time password to the address on your account.</p>
+
+          <div v-if="forgotError" class="form-error">{{ forgotError }}</div>
+
+          <div class="field">
+            <label for="fg-email">Email</label>
+            <input id="fg-email" type="email" v-model="forgotEmail" autocomplete="username"
+                   placeholder="you@example.com" autofocus />
+          </div>
+          <button class="btn btn-primary btn-block" type="submit" :disabled="forgotBusy">
+            {{ forgotBusy ? 'Sending…' : 'Email me a one-time password' }}
+          </button>
+          <p class="login-foot">
+            <a href="#" @click.prevent="closeForgot">Back to sign in</a>
+          </p>
+        </template>
+      </form>
+    </div>
+  </div>
+
+  <!-- ========= forced first password change ========= -->
+  <!-- Rendered instead of the app, not on top of it: the API refuses every
+       other route until this is done, so showing the tracker behind it would
+       only be a wall of failed requests. -->
+  <div v-else-if="mustChangePassword" class="login">
+    <aside class="login-pitch">
+      <div class="mark mark-lg">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 2.6 4.4 5.9v5.4c0 4.6 3.1 8.6 7.6 9.9 4.5-1.3 7.6-5.3 7.6-9.9V5.9L12 2.6Z"
+                stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="m8.6 12.1 2.4 2.4 4.4-4.8" stroke="currentColor" stroke-width="1.8"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <h2>One more step</h2>
+      <p class="pitch-lede">The password you just used was a one-time password. Choose your own before going on.</p>
+      <ul class="pitch-list">
+        <li>
+          <strong>Nobody else can use it twice</strong>
+          The one-time password stops working the moment you set a real one.
+        </li>
+        <li>
+          <strong>At least 10 characters</strong>
+          Length beats punctuation. A short phrase you can remember is fine.
+        </li>
+        <li>
+          <strong>Everything else is on hold</strong>
+          Until this is done the tracker will not let this account do anything.
+        </li>
+      </ul>
+    </aside>
+
+    <div class="login-panel">
+      <form class="login-card" @submit.prevent="submitFirstPassword">
+        <h1>Set your password</h1>
+        <p class="sub">Signed in as <strong>{{ me.email || me.username }}</strong>.</p>
+
+        <div v-if="firstPasswordError" class="form-error">{{ firstPasswordError }}</div>
+
+        <div v-if="!firstPasswordForm.current_password" class="field">
+          <label for="fp-cur">One-time password</label>
+          <input id="fp-cur" type="password" v-model="firstPasswordForm.current_password"
+                 autocomplete="current-password" />
+          <span class="hint">The one you were emailed, or the one your administrator gave you.</span>
+        </div>
+        <div class="field">
+          <label for="fp-new">New password</label>
+          <input id="fp-new" type="password" v-model="firstPasswordForm.new_password"
+                 autocomplete="new-password" autofocus />
+          <span class="hint">At least 10 characters.</span>
+        </div>
+        <div class="field">
+          <label for="fp-confirm">Confirm new password</label>
+          <input id="fp-confirm" type="password" v-model="firstPasswordForm.confirm"
+                 autocomplete="new-password" />
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" :disabled="firstPasswordBusy">
+          {{ firstPasswordBusy ? 'Saving…' : 'Set password and continue' }}
+        </button>
+        <p class="login-foot">
+          Wrong account? <a href="#" @click.prevent="doLogout">Sign out</a>
         </p>
       </form>
     </div>
@@ -911,10 +1296,10 @@ createApp({
       </div>
 
       <nav class="viewtabs">
-        <button :class="{ active: view === 'certs' }" @click="switchView('certs')">Certificates</button>
+        <button :class="{ active: view === 'certs' }" @click="switchView('certs')">Dashboard</button>
         <button :class="{ active: view === 'reviews' }" @click="switchView('reviews')">
           Reviews
-          <span v-if="myReviewQueue.length" class="badge-count">{{ myReviewQueue.length }}</span>
+          <span v-if="reviewQueueCount" class="badge-count">{{ reviewQueueCount }}</span>
         </button>
         <button v-if="isAdmin" :class="{ active: view === 'audit' }" @click="switchView('audit')">Audit</button>
         <button v-if="isAdmin" :class="{ active: view === 'users' }" @click="switchView('users')">Users</button>
@@ -962,6 +1347,11 @@ createApp({
         <button :class="{ active: filterEnv === 'all' }" @click="filterEnv = 'all'">All</button>
         <button v-for="e in environments" :key="e" :class="{ active: filterEnv === e }" @click="filterEnv = e">{{ e }}</button>
       </div>
+      <div class="tabs">
+        <button :class="{ active: filterKind === 'all' }" @click="filterKind = 'all'">Both</button>
+        <button v-for="k in kindOptions" :key="k.key"
+                :class="{ active: filterKind === k.key }" @click="filterKind = k.key">{{ k.plural }}</button>
+      </div>
       <span class="result-count">{{ filteredCerts.length }} shown</span>
       <span v-if="filterSev" class="result-count">
         · {{ sevLabel(filterSev) }} only
@@ -969,17 +1359,17 @@ createApp({
       </span>
       <span class="spacer"></span>
       <button v-if="isAdmin" class="btn btn-sm btn-ghost" @click="runCheck">Run check now</button>
-      <button class="btn btn-sm btn-primary" @click="openCreate">Add certificate</button>
+      <button class="btn btn-sm btn-primary" @click="openCreate()">Add</button>
     </div>
 
     <div v-if="loading" class="loading">Loading certificates…</div>
 
     <div v-else-if="filteredCerts.length === 0" class="empty">
-      <h3 v-if="activeCerts.length === 0">No certificates tracked yet</h3>
+      <h3 v-if="activeCerts.length === 0">Nothing tracked yet</h3>
       <h3 v-else>Nothing matches this filter</h3>
-      <p v-if="activeCerts.length === 0">Add one to start getting rotation reminders before it expires.</p>
-      <p v-else>Try a different environment or clear the severity filter.</p>
-      <button v-if="activeCerts.length === 0" class="btn btn-primary" @click="openCreate">Add certificate</button>
+      <p v-if="activeCerts.length === 0">Add a certificate or a token to start getting rotation reminders before it expires.</p>
+      <p v-else>Try a different environment or type, or clear the severity filter.</p>
+      <button v-if="activeCerts.length === 0" class="btn btn-primary" @click="openCreate()">Add</button>
     </div>
 
     <div v-else class="grid">
@@ -989,6 +1379,7 @@ createApp({
           <div>
             <div class="card-name">{{ c.name }}</div>
             <div class="card-meta">
+              <span class="tag kind" :class="c.kind">{{ kindLabel(c.kind) }}</span>
               <span class="tag">{{ c.environment }}</span>
               <span class="owner" :class="{ mine: c.can_edit }"
                     :title="'Owned by ' + (c.owner_username || 'nobody')">
@@ -1004,6 +1395,21 @@ createApp({
               {{ lifecycle(c).label }}
             </span>
           </div>
+        </div>
+
+        <div v-if="c.pending_deletion_id" class="ribbon danger">
+          <div class="ribbon-body">
+            <strong>Deletion in review</strong>
+            <span v-if="pendingDeletionFor(c)">
+              Requested by <strong>{{ pendingDeletionFor(c).requested_by_username }}</strong>
+              · reason: {{ pendingDeletionFor(c).reason }}
+            </span>
+            <span v-else>Waiting for a second person to approve it.</span>
+          </div>
+          <button v-if="pendingDeletionFor(c) && pendingDeletionFor(c).can_review"
+                  class="btn btn-sm btn-primary" @click="openDeleteReview(pendingDeletionFor(c))">Review</button>
+          <button v-else-if="pendingDeletionFor(c) && pendingDeletionFor(c).can_withdraw"
+                  class="btn btn-sm btn-ghost" @click="withdrawDeletion(pendingDeletionFor(c))">Withdraw</button>
         </div>
 
         <div v-if="c.pending_renewal_id" class="ribbon pending">
@@ -1084,7 +1490,7 @@ createApp({
           </button>
           <span class="spacer"></span>
           <template v-if="c.can_edit">
-            <button v-if="!c.pending_renewal_id" class="btn btn-sm btn-accent"
+            <button v-if="!c.pending_renewal_id && !c.pending_deletion_id" class="btn btn-sm btn-accent"
                     title="Mark renewed — needs proof and a second person's approval"
                     @click="openRenew(c)">Renew</button>
             <button class="btn btn-sm btn-ghost" @click="openEdit(c)">Edit</button>
@@ -1100,7 +1506,8 @@ createApp({
               <div v-if="menu === 'cert-' + c.id" class="menu menu-right" @click.stop>
                 <button @click="closeMenu(); testCert(c)">Send test notification</button>
                 <button @click="closeMenu(); openOwner(c)">Change owner…</button>
-                <button class="danger" @click="closeMenu(); deleteCert(c)">Delete certificate</button>
+                <button v-if="!c.pending_deletion_id" class="danger"
+                        @click="closeMenu(); openDelete(c)">Request deletion…</button>
               </div>
             </div>
           </template>
@@ -1128,10 +1535,11 @@ createApp({
         <span class="disclosure-count">{{ rotatedCerts.length }}</span>
       </button>
       <div v-if="showRotated" class="table-wrap"><table class="table">
-        <thead><tr><th>Certificate</th><th>Env</th><th>Expired</th><th>Owner</th><th>Rotated</th></tr></thead>
+        <thead><tr><th>Name</th><th>Type</th><th>Env</th><th>Expired</th><th>Owner</th><th>Rotated</th></tr></thead>
         <tbody>
           <tr v-for="c in rotatedCerts" :key="c.id">
             <td>{{ c.name }}</td>
+            <td><span class="tag kind" :class="c.kind">{{ kindLabel(c.kind) }}</span></td>
             <td><span class="tag">{{ c.environment }}</span></td>
             <td class="mono">{{ c.expiry_date.slice(0,10) }}</td>
             <td>{{ c.owner_username }}</td>
@@ -1152,18 +1560,20 @@ createApp({
         </span>
         <span class="disclosure-text">
           <strong>Deleted</strong>
-          <span class="hint">Soft-deleted certificates — nothing is lost, restore any of them</span>
+          <span class="hint">Soft-deleted after review — nothing is lost, restore any of them</span>
         </span>
         <span v-if="showDeleted" class="disclosure-count">{{ deletedCerts.length }}</span>
       </button>
       <div v-if="showDeleted" class="table-wrap"><table class="table">
-        <thead><tr><th>Certificate</th><th>Env</th><th>Owner</th><th>Deleted</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Type</th><th>Env</th><th>Owner</th><th>Reason</th><th>Deleted</th><th></th></tr></thead>
         <tbody>
-          <tr v-if="deletedCerts.length === 0"><td colspan="5" class="hint">Nothing deleted.</td></tr>
+          <tr v-if="deletedCerts.length === 0"><td colspan="7" class="hint">Nothing deleted.</td></tr>
           <tr v-for="c in deletedCerts" :key="c.id">
             <td>{{ c.name }}</td>
+            <td><span class="tag kind" :class="c.kind">{{ kindLabel(c.kind) }}</span></td>
             <td><span class="tag">{{ c.environment }}</span></td>
             <td>{{ c.owner_username }}</td>
+            <td>{{ c.deletion_reason || '—' }}</td>
             <td><span class="life-pill deleted">Deleted</span> {{ fmtDateTime(c.deleted_at) }}</td>
             <td><button class="btn btn-sm btn-ghost" @click="restoreCert(c)">Restore</button></td>
           </tr>
@@ -1175,12 +1585,12 @@ createApp({
     <!-- ---------- reviews ---------- -->
     <template v-if="view === 'reviews'">
       <div class="panel-intro">
-        <h2>Rotation reviews</h2>
-        <p>A rotation is only recorded once a <strong>second person</strong> confirms the evidence.
-           You cannot approve a request you submitted yourself.</p>
+        <h2>Reviews</h2>
+        <p>Rotating and deleting both need a <strong>second person</strong>: a rotation must show
+           evidence, a deletion must state a reason. You cannot approve a request you made yourself.</p>
       </div>
 
-      <h3 class="list-head">Waiting for you ({{ myReviewQueue.length }})</h3>
+      <h3 class="list-head">Rotations waiting for you ({{ myReviewQueue.length }})</h3>
       <div v-if="myReviewQueue.length === 0" class="empty small"><p>Nothing needs your review.</p></div>
       <div v-else class="review-list">
         <div v-for="r in myReviewQueue" :key="r.id" class="review-row">
@@ -1195,7 +1605,7 @@ createApp({
         </div>
       </div>
 
-      <h3 class="list-head">Submitted, waiting for someone else ({{ awaitingOthers.length }})</h3>
+      <h3 class="list-head">Rotations submitted, waiting for someone else ({{ awaitingOthers.length }})</h3>
       <div v-if="awaitingOthers.length === 0" class="empty small"><p>Nothing pending.</p></div>
       <div v-else class="review-list">
         <div v-for="r in awaitingOthers" :key="r.id" class="review-row muted">
@@ -1210,7 +1620,61 @@ createApp({
         </div>
       </div>
 
-      <h3 class="list-head">Recently decided</h3>
+      <h3 class="list-head">Deletions waiting for you ({{ myDeletionQueue.length }})</h3>
+      <div v-if="myDeletionQueue.length === 0" class="empty small"><p>No deletions need your review.</p></div>
+      <div v-else class="review-list">
+        <div v-for="d in myDeletionQueue" :key="d.id" class="review-row danger">
+          <div class="review-main">
+            <div class="review-name">
+              {{ d.certificate_name }}
+              <span class="tag kind" :class="d.certificate_kind">{{ kindLabel(d.certificate_kind) }}</span>
+              <span class="tag">{{ d.environment }}</span>
+            </div>
+            <div class="hint">
+              Requested by <strong>{{ d.requested_by_username }}</strong> · {{ fmtDateTime(d.requested_at) }}
+            </div>
+            <div class="quote">{{ d.reason }}</div>
+          </div>
+          <button class="btn btn-sm btn-primary" @click="openDeleteReview(d)">Review</button>
+        </div>
+      </div>
+
+      <h3 class="list-head">Deletions you requested, waiting for someone else ({{ awaitingDeletionOthers.length }})</h3>
+      <div v-if="awaitingDeletionOthers.length === 0" class="empty small"><p>Nothing pending.</p></div>
+      <div v-else class="review-list">
+        <div v-for="d in awaitingDeletionOthers" :key="d.id" class="review-row muted">
+          <div class="review-main">
+            <div class="review-name">
+              {{ d.certificate_name }}
+              <span class="tag kind" :class="d.certificate_kind">{{ kindLabel(d.certificate_kind) }}</span>
+              <span class="tag">{{ d.environment }}</span>
+            </div>
+            <div class="hint">You requested this {{ fmtDateTime(d.requested_at) }}</div>
+            <div class="quote">{{ d.reason }}</div>
+          </div>
+          <button v-if="d.can_withdraw" class="btn btn-sm btn-ghost" @click="withdrawDeletion(d)">Withdraw</button>
+        </div>
+      </div>
+
+      <h3 class="list-head">Recently decided deletions</h3>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Name</th><th>Status</th><th>Reason</th><th>Requested by</th><th>Reviewed by</th><th>When</th></tr></thead>
+        <tbody>
+          <tr v-for="d in deletions.filter(x => x.status !== 'pending_review').slice(0, 25)" :key="d.id">
+            <td>{{ d.certificate_name }}</td>
+            <td><span class="status" :class="d.status">{{ statusLabel(d.status) }}</span></td>
+            <td>{{ d.reason }}</td>
+            <td>{{ d.requested_by_username }}</td>
+            <td>{{ d.reviewed_by_username || '—' }}</td>
+            <td>{{ fmtDateTime(d.reviewed_at || d.requested_at) }}</td>
+          </tr>
+          <tr v-if="deletions.filter(x => x.status !== 'pending_review').length === 0">
+            <td colspan="6" class="hint">No deletion decisions yet.</td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <h3 class="list-head">Recently decided rotations</h3>
       <div class="table-wrap"><table class="table">
         <thead><tr><th>Certificate</th><th>Status</th><th>Submitted by</th><th>Reviewed by</th><th>When</th><th></th></tr></thead>
         <tbody>
@@ -1237,10 +1701,16 @@ createApp({
       </div>
 
       <div class="toolbar">
-        <div class="tabs">
+        <div class="tabs" data-filter="category">
           <button v-for="t in auditTabs" :key="t.key"
                   :class="{ active: auditCategory === t.key }"
                   @click="setAuditCategory(t.key)">{{ t.label }}</button>
+        </div>
+        <span class="filter-label">of</span>
+        <div class="tabs" data-filter="kind">
+          <button :class="{ active: auditKind === 'all' }" @click="auditKind = 'all'">Any type</button>
+          <button v-for="k in kindOptions" :key="k.key"
+                  :class="{ active: auditKind === k.key }" @click="auditKind = k.key">{{ k.plural }}</button>
         </div>
         <span class="spacer"></span>
         <input class="search" type="search" v-model="auditSearch"
@@ -1248,18 +1718,23 @@ createApp({
       </div>
 
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>When</th><th>Who</th><th>Action</th><th>What happened</th><th>Entity</th></tr></thead>
+        <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Type</th><th>What happened</th><th>Entity</th></tr></thead>
         <tbody>
           <tr v-for="e in visibleAudit" :key="e.id">
             <td class="nowrap">{{ fmtDateTime(e.created_at) }}</td>
             <td class="nowrap"><span class="who-cell"><span class="avatar sm">{{ initials(e.actor) }}</span>{{ e.actor || '—' }}</span></td>
             <td class="nowrap"><span class="action-pill" :class="actionTone(e.action)">{{ actionLabel(e.action) }}</span></td>
+            <td class="nowrap">
+              <span v-if="entryKind(e)" class="tag kind" :class="entryKind(e)">{{ kindLabel(entryKind(e)) }}</span>
+              <span v-else class="hint">—</span>
+            </td>
             <td>{{ describeEntry(e) }}</td>
             <td class="hint nowrap">{{ e.entity_type }}<template v-if="e.entity_id"> #{{ e.entity_id }}</template></td>
           </tr>
           <tr v-if="visibleAudit.length === 0">
-            <td colspan="5" class="hint">
-              <template v-if="auditSearch">Nothing matches “{{ auditSearch }}” in this category.</template>
+            <td colspan="6" class="hint">
+              <template v-if="auditSearch">Nothing matches “{{ auditSearch }}” in this view.</template>
+              <template v-else-if="auditKind !== 'all'">Nothing recorded against {{ auditKind === 'token' ? 'tokens' : 'certificates' }} in this category.</template>
               <template v-else-if="auditCategory !== 'all'">Nothing recorded in this category yet.</template>
               <template v-else>Nothing recorded yet.</template>
             </td>
@@ -1277,21 +1752,29 @@ createApp({
     <template v-if="view === 'users' && isAdmin">
       <div class="panel-intro">
         <h2>Users</h2>
-        <p>Accounts are disabled rather than deleted, so certificate ownership and audit history keep pointing at a real person.</p>
+        <p>An account <strong>is</strong> an email address — that is what people sign in with and where
+           one-time passwords go. Accounts are disabled rather than deleted, so ownership and audit
+           history keep pointing at a real person.</p>
       </div>
       <div class="toolbar">
         <span class="spacer"></span>
         <button class="btn btn-sm btn-primary" @click="openUserCreate">Add user</button>
       </div>
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Email (account)</th><th>Handle</th><th>Name</th><th>Role</th><th>Status</th><th></th></tr></thead>
         <tbody>
           <tr v-for="u in users" :key="u.id" :class="{ muted: u.disabled }">
-            <td class="mono">{{ u.username }}</td>
+            <td class="mono">{{ u.email || '—' }}</td>
+            <td class="mono hint">{{ u.username }}</td>
             <td>{{ u.display_name || '—' }}</td>
-            <td>{{ u.email || '—' }}</td>
             <td><span class="role-pill" :class="u.role">{{ u.role }}</span></td>
-            <td>{{ u.disabled ? 'Disabled' : 'Active' }}</td>
+            <td>
+              <template v-if="u.disabled">Disabled</template>
+              <template v-else-if="u.must_change_password">
+                <span class="status pending_review" title="Signed in with a temporary password; must choose their own before the account can do anything">Must set password</span>
+              </template>
+              <template v-else>Active</template>
+            </td>
             <td class="nowrap">
               <button class="btn btn-sm btn-ghost" @click="openUserEdit(u)">Edit</button>
               <button class="btn btn-sm btn-ghost" @click="resetUserPassword(u)">Reset password</button>
@@ -1309,15 +1792,30 @@ createApp({
   <div v-if="showModal" class="overlay" @click.self="closeModal">
     <div class="modal">
       <div class="modal-head">
-        <h2>{{ editing ? 'Edit certificate' : 'Add certificate' }}</h2>
+        <h2>{{ editing ? ('Edit ' + kindLower(form.kind)) : 'Add a certificate or token' }}</h2>
         <button class="btn btn-sm btn-ghost" @click="closeModal">Close</button>
       </div>
       <div class="modal-body">
         <div v-if="formError" class="form-error">{{ formError }}</div>
 
         <div class="field">
+          <label>Type</label>
+          <div class="day-toggle">
+            <button v-for="k in kindOptions" :key="k.key" type="button"
+              :class="{ on: form.kind === k.key }" :disabled="!!editing"
+              @click="form.kind = k.key">{{ k.label }}</button>
+          </div>
+          <span v-if="editing" class="hint">The type is fixed once created — its history and past
+            notifications already refer to it by name.</span>
+          <span v-else-if="form.kind === 'token'" class="hint">Tokens expire and need rotating just
+            like certificates, and get the same reminders and four-eyes rotation.</span>
+          <span v-else class="hint">Reminders, rotation review and deletion review work the same for both.</span>
+        </div>
+
+        <div class="field">
           <label>Name</label>
-          <input type="text" v-model="form.name" placeholder="e.g. api.example.com TLS" />
+          <input type="text" v-model="form.name"
+                 :placeholder="form.kind === 'token' ? 'e.g. payments-api service token' : 'e.g. api.example.com TLS'" />
         </div>
 
         <div class="row-2">
@@ -1376,7 +1874,7 @@ createApp({
       <div class="modal-foot">
         <button class="btn btn-ghost" @click="closeModal">Cancel</button>
         <button class="btn btn-primary" :disabled="saving" @click="submitForm">
-          {{ saving ? 'Saving…' : (editing ? 'Save changes' : 'Add certificate') }}
+          {{ saving ? 'Saving…' : (editing ? 'Save changes' : ('Add ' + kindLower(form.kind))) }}
         </button>
       </div>
     </div>
@@ -1392,8 +1890,8 @@ createApp({
       <div class="modal-body">
         <div class="callout">
           This does <strong>not</strong> complete the rotation on its own. Once submitted, another
-          person has to check the evidence and approve it. Only then is this certificate marked
-          rotated and a replacement created with the new dates below.
+          person has to check the evidence and approve it. Only then is this {{ kindLower(renewModal.kind) }}
+          marked rotated and a replacement created with the new dates below.
         </div>
         <div v-if="renewError" class="form-error">{{ renewError }}</div>
 
@@ -1409,9 +1907,9 @@ createApp({
         </div>
 
         <div class="field">
-          <label>Proof of the new certificate</label>
+          <label>Proof of the new {{ kindLower(renewModal.kind) }}</label>
           <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" @change="onEvidencePicked" />
-          <span class="hint">A screenshot of the new certificate's details. PNG, JPEG, WebP or GIF, up to {{ maxUploadMB }} MB.</span>
+          <span class="hint">A screenshot of the new {{ kindLower(renewModal.kind) }}'s details. PNG, JPEG, WebP or GIF, up to {{ maxUploadMB }} MB.</span>
           <div v-if="renewPreview" class="evidence-preview">
             <img :src="renewPreview" alt="Evidence preview" />
             <span class="hint">{{ renewFile.name }} · {{ fmtBytes(renewFile.size) }}</span>
@@ -1480,6 +1978,100 @@ createApp({
     </div>
   </div>
 
+  <!-- request deletion -->
+  <div v-if="deleteModal" class="overlay" @click.self="deleteModal = null">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Delete "{{ deleteModal.name }}"?</h2>
+        <button class="btn btn-sm btn-ghost" @click="deleteModal = null">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="callout">
+          Nothing is removed yet. Another person has to read your reason and approve it — only then
+          is this {{ kindLower(deleteModal.kind) }} hidden and its reminders stopped. When that
+          happens, everyone on its notification channels is told, and an administrator can still
+          restore it.
+        </div>
+        <div v-if="deleteError" class="form-error">{{ deleteError }}</div>
+
+        <div class="detail">
+          <div class="detail-row"><span class="k">Type</span><span class="v">{{ kindLabel(deleteModal.kind) }}</span></div>
+          <div class="detail-row"><span class="k">Environment</span><span class="v">{{ deleteModal.environment }}</span></div>
+          <div class="detail-row"><span class="k">Expiry</span><span class="v mono">{{ deleteModal.expiry_date.slice(0,10) }}</span></div>
+          <div class="detail-row"><span class="k">Notified on deletion</span>
+            <span class="v">
+              <template v-if="deleteModal.teams_webhook_set || deleteModal.notify_email_count">
+                <template v-if="deleteModal.teams_webhook_set">Teams</template>
+                <template v-if="deleteModal.teams_webhook_set && deleteModal.notify_email_count"> · </template>
+                <template v-if="deleteModal.notify_email_count">{{ deleteModal.notify_email_count }} email address(es)</template>
+              </template>
+              <template v-else>No channel configured — nobody will be told</template>
+            </span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Reason for deleting <span class="hint">(required)</span></label>
+          <textarea v-model="deleteReason"
+            placeholder="Decommissioned with the service, replaced outside the tracker, created by mistake…"></textarea>
+          <span class="hint">The reviewer reads this, it goes out in the deletion notification, and it
+            stays on the record permanently.</span>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" @click="deleteModal = null">Cancel</button>
+        <button class="btn btn-danger-solid" :disabled="deleteSaving" @click="submitDeletion">
+          {{ deleteSaving ? 'Requesting…' : 'Request deletion' }}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- review a deletion -->
+  <div v-if="deleteReviewModal" class="overlay" @click.self="deleteReviewModal = null">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Review deletion — {{ deleteReviewModal.certificate_name }}</h2>
+        <button class="btn btn-sm btn-ghost" @click="deleteReviewModal = null">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="callout">
+          Approving hides this {{ kindLower(deleteReviewModal.certificate_kind) }} and stops its
+          expiry reminders, then tells everyone on its notification channels who asked, who approved
+          and why. An administrator can restore it afterwards.
+        </div>
+
+        <div class="detail">
+          <div class="detail-row"><span class="k">Type</span><span class="v">{{ kindLabel(deleteReviewModal.certificate_kind) }}</span></div>
+          <div class="detail-row"><span class="k">Environment</span><span class="v">{{ deleteReviewModal.environment }}</span></div>
+          <div class="detail-row"><span class="k">Requested by</span><span class="v">{{ deleteReviewModal.requested_by_username }}</span></div>
+          <div class="detail-row"><span class="k">Requested at</span><span class="v">{{ fmtDateTime(deleteReviewModal.requested_at) }}</span></div>
+        </div>
+
+        <div class="field">
+          <label>Reason given</label>
+          <div class="quote">{{ deleteReviewModal.reason }}</div>
+        </div>
+
+        <div class="field">
+          <label>Review note <span class="hint">(required to refuse; included in the notification)</span></label>
+          <textarea v-model="deleteReviewNote"
+            placeholder="What you checked, or why this should stay…"></textarea>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" :disabled="!!deleteReviewBusy" @click="rejectDeletion">
+          {{ deleteReviewBusy === 'reject' ? 'Refusing…' : 'Refuse — keep it' }}
+        </button>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost" @click="deleteReviewModal = null">Cancel</button>
+        <button class="btn btn-danger-solid" :disabled="!!deleteReviewBusy" @click="approveDeletion">
+          {{ deleteReviewBusy === 'approve' ? 'Deleting…' : 'Approve deletion' }}
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- transfer owner -->
   <div v-if="ownerModal" class="overlay" @click.self="ownerModal = null">
     <div class="modal modal-sm">
@@ -1511,7 +2103,7 @@ createApp({
   <div v-if="historyModal" class="overlay" @click.self="historyModal = null">
     <div class="modal modal-wide">
       <div class="modal-head">
-        <h2>History — {{ historyModal.name }}</h2>
+        <h2>History — {{ historyModal.name }} <span class="tag kind" :class="historyModal.kind">{{ kindLabel(historyModal.kind) }}</span></h2>
         <button class="btn btn-sm btn-ghost" @click="historyModal = null">Close</button>
       </div>
       <div class="modal-body">
@@ -1524,6 +2116,21 @@ createApp({
               <td>{{ describeEntry(e) }}</td>
             </tr>
             <tr v-if="historyEntries.length === 0"><td colspan="3" class="hint">No history yet.</td></tr>
+          </tbody>
+        </table></div>
+
+        <h3 class="list-head">Deletion requests</h3>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Status</th><th>Reason</th><th>Requested by</th><th>Reviewed by</th><th>When</th></tr></thead>
+          <tbody>
+            <tr v-for="d in deletionsFor(historyModal.id)" :key="d.id">
+              <td><span class="status" :class="d.status">{{ statusLabel(d.status) }}</span></td>
+              <td>{{ d.reason }}</td>
+              <td>{{ d.requested_by_username }}</td>
+              <td>{{ d.reviewed_by_username || '—' }}</td>
+              <td class="nowrap">{{ fmtDateTime(d.reviewed_at || d.requested_at) }}</td>
+            </tr>
+            <tr v-if="deletionsFor(historyModal.id).length === 0"><td colspan="5" class="hint">None.</td></tr>
           </tbody>
         </table></div>
 
@@ -1585,22 +2192,24 @@ createApp({
       <div class="modal-body">
         <div v-if="userError" class="form-error">{{ userError }}</div>
         <div class="field">
+          <label>Email <span class="hint">(this is the account)</span></label>
+          <input type="email" class="mono" v-model="userForm.email" placeholder="you@example.com" />
+          <span class="hint">They sign in with this address, and one-time passwords go to it.</span>
+        </div>
+        <div v-if="userModal.mode === 'edit'" class="field">
           <label>Username</label>
-          <input type="text" class="mono" v-model="userForm.username" :disabled="userModal.mode === 'edit'" />
-          <span v-if="userModal.mode === 'create'" class="hint">Lower-case letters, digits, dot, dash or underscore.</span>
+          <input type="text" class="mono" v-model="userForm.username" disabled />
+          <span class="hint">The short handle shown on cards and in the audit log. Fixed once created.</span>
         </div>
         <div class="field">
           <label>Display name</label>
           <input type="text" v-model="userForm.display_name" />
         </div>
-        <div class="field">
-          <label>Email</label>
-          <input type="text" class="mono" v-model="userForm.email" />
-        </div>
         <div v-if="userModal.mode === 'create'" class="field">
           <label>Initial password</label>
           <input type="text" class="mono" v-model="userForm.password" />
-          <span class="hint">At least 10 characters. Ask them to change it after their first sign-in.</span>
+          <span class="hint">At least 10 characters. They are forced to replace it at their first
+            sign-in, so hand it over however you like.</span>
         </div>
         <div class="field">
           <label>Role</label>

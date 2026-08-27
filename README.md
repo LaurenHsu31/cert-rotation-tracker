@@ -1,11 +1,11 @@
 # Certificate Rotation Tracker
 
-A small self-hosted service that tracks certificates and their expiry, shows how
-much runway each one has left with escalating severity, and sends reminders to
-**Microsoft Teams** and/or **email** before rotation is due.
+A small self-hosted service that tracks **certificates and tokens** and their
+expiry, shows how much runway each one has left with escalating severity, and
+sends reminders to **Microsoft Teams** and/or **email** before rotation is due.
 
-One central instance tracks certificates across all environments (`dev` / `stg` /
-`prd`); the environment is a tag on each certificate, not a separate deployment.
+One central instance tracks them across all environments (`dev` / `stg` /
+`prd`); the environment is a tag on each item, not a separate deployment.
 
 ## Highlights
 
@@ -23,6 +23,10 @@ One central instance tracks certificates across all environments (`dev` / `stg` 
   approaches, then a repeat cadence that tightens the closer expiry gets —
   every 5 days under 45, every 3 under 30, daily under 10. De-duplicated so you
   are never spammed twice in a day.
+- **Certificates and tokens.** An API or service token expires and needs
+  rotating exactly like a certificate, so both are tracked the same way. The
+  type is picked when you add it, drives the wording in every notification, and
+  is fixed thereafter — its history already refers to it by that name.
 - **Ownership, not a free-for-all.** Whoever creates a certificate owns it. Only
   the owner and administrators can edit, delete or test it; everyone else gets a
   read-only view with the Teams webhook URL and recipient list redacted.
@@ -30,10 +34,19 @@ One central instance tracks certificates across all environments (`dev` / `stg` 
   certificate and a **second person's** approval. On approval the old
   certificate is marked rotated and its replacement is created automatically,
   inheriting the reminder configuration.
+- **Four-eyes deletion.** Deleting is a request, not a click: the requester must
+  say **why**, a second person approves it, and once it goes through everyone on
+  the item's notification channels is told who asked, who approved and the
+  reason. The delete itself stays soft, so it is still recoverable.
 - **Everything is audited.** Every change records who did it and when, filtered
-  by category (certificates, rotations, users, sign-in, system), and deletes are
-  soft — so "who touched my reminder settings" is always answerable and an
-  accidental delete is recoverable.
+  on two axes — what happened (changes, rotations, deletions, users, sign-in,
+  system) and what it happened to (certificates, tokens) — and deletes are soft,
+  so "who touched my reminder settings" is always answerable and an accidental
+  delete is recoverable.
+- **The account is an email address.** People sign in with their address, and
+  a forgotten password self-serves: a one-time password is mailed out, works
+  once, expires, and the tracker refuses to do anything else until the holder
+  has chosen a real password.
 
 ## Quick start (on-prem, Docker)
 
@@ -75,7 +88,8 @@ docker compose --profile mailtest up --build
 - `internal/config` — all env config.
 - `internal/auth` — password hashing (PBKDF2-HMAC-SHA256, stdlib only), session
   tokens and the request-scoped `Identity`.
-- `internal/models` — the `Certificate`, `User`, `Renewal` and audit types.
+- `internal/models` — the `Certificate` (certificate or token), `User`,
+  `Renewal`, `DeletionRequest` and audit types.
 - `internal/reminder` — the escalating repeat cadence.
 - `internal/severity` — days-remaining → level, with configurable cutoffs.
 - `internal/store` — Postgres access + embedded schema (`internal/store/migrations`).
@@ -137,11 +151,14 @@ Consequences, by design:
 Authentication is local accounts with server-side sessions — no external
 identity provider needed, so the tracker still runs air-gapped.
 
-| | read every certificate | edit / delete / test | approve a rotation | manage users, audit, run scan |
+| | read everything | edit / test / request deletion | approve a rotation or deletion | manage users, audit, run scan |
 |---|---|---|---|---|
 | **owner** | ✅ | ✅ own only | ✅ others' requests | — |
 | **user** | ✅ (redacted) | — | ✅ others' requests | — |
 | **admin** | ✅ | ✅ any | ✅ others' requests | ✅ |
+
+Nobody — administrators included — can delete a tracked certificate or token on
+their own; see [Deletion workflow](#deletion-workflow-four-eyes).
 
 Details worth knowing:
 
@@ -170,6 +187,53 @@ Details worth knowing:
 
 Set `AUTH_ENABLED=false` for local development only: it runs every request as
 the bootstrap admin with no login at all.
+
+## Passwords and account recovery
+
+An account **is** an email address. That is what people type to sign in and
+where a one-time password goes; the short handle you see on cards and in the
+audit log is derived from it and is only cosmetic.
+
+```
+forgot your password
+  └─ POST /api/auth/forgot { email }        ← always answers 200, always the same
+         │                                    body: a public endpoint that
+         │                                    distinguished known from unknown
+         ▼                                    addresses would be an account oracle
+   one-time password
+     • replaces the current password outright   ← so the old one cannot be reused
+     • expires (PASSWORD_RESET_TTL_MINUTES, default 30)
+     • drops every live session for the account
+     • one per PASSWORD_RESET_COOLDOWN_SECONDS (default 120)
+         │
+         ▼
+   sign in with it → the account is FROZEN
+         │
+         │  every route answers 403 { code: "password_change_required" }
+         │  except: POST /api/auth/password, POST /api/auth/logout, GET /api/config
+         ▼
+   choose a new password (new + confirm) → frozen state lifts, OTP is dead
+```
+
+The freeze is enforced in the auth middleware, not per handler, so a route added
+later is covered by default and has to be listed explicitly to escape it.
+
+The same freeze applies to any password somebody else chose: an account created
+by an administrator, and an administrator's password reset, both hand over a
+credential the admin knows, so the holder has to replace it before the account
+can do anything. A bootstrap admin password that the tracker *generated* is
+treated the same way, because it is printed to the startup log.
+
+**Self-service reset needs SMTP.** With `SMTP_HOST` blank the whole email
+channel is off — no expiry reminders, and no password reset — and the reset
+endpoint says so plainly (`503`) rather than pretending to send. That is a fact
+about the deployment, not about the address, so it leaks nothing. Startup logs
+`email_enabled` so you can tell at a glance. Until a relay is configured,
+password recovery is the admin `Reset password` button.
+
+**Legacy accounts.** Accounts created before email became the identifier can
+still sign in with their username, so upgrading does not lock anyone out. Give
+them an address on the Users screen to move them across.
 
 ## Rotation workflow (four eyes)
 
@@ -206,6 +270,48 @@ everything else), hashed with SHA-256 for tamper-evidence, and served back with
 `nosniff` and a `default-src 'none'; sandbox` CSP. Only real images are
 accepted — the browser's declared content type is ignored in favour of the
 bytes themselves.
+
+## Deletion workflow (four eyes)
+
+Removing a certificate or token is the one action that makes its alerts stop
+forever, so it needs the same two people a rotation does — plus a reason on the
+record.
+
+```
+owner clicks "Request deletion…"
+  └─ reason (required, stored permanently and read by everyone notified)
+         │
+         ▼
+   status: pending_review        ← the item keeps alerting meanwhile
+         │
+         ├── anyone EXCEPT the requester reviews the reason
+         │
+    ┌────┴────┐
+ approve    refuse (note required)
+    │            └─ nothing is removed; the item carries on as before
+    ▼
+ one transaction:
+   • certificate      → deleted_at set + the approved reason stamped on the row
+   • open renewal     → withdrawn (it could never be actioned now)
+   • deletion request → approved, linked to both people
+   • audit            → one entry on the request, one on the certificate
+         │
+         ▼
+ notification to the item's Teams webhook and email recipients,
+ plus the owner's own address: what was deleted, who asked, who
+ approved, the reason and the reviewer's note
+```
+
+The delete stays **soft** — an administrator can restore the row, which also
+clears the recorded reason. A restored item starts alerting again.
+
+`DELETE /api/certificates/{id}` is therefore no longer a delete: it answers
+`409` pointing at this workflow, so an old script fails loudly instead of
+silently doing nothing.
+
+If the item has no Teams webhook and no email recipients, the deletion still
+goes through and the API reports `notification.sent: false` with the reason —
+there was simply nobody to tell.
 
 ## Teams setup (important)
 
@@ -250,6 +356,8 @@ port 587 negotiates STARTTLS automatically.
 | `BOOTSTRAP_ADMIN_USERNAME` | `admin` | First-run admin (only when no users exist) |
 | `BOOTSTRAP_ADMIN_PASSWORD` | generated | First-run password; printed once if blank |
 | `MAX_UPLOAD_MB` | `5` | Ceiling per renewal evidence image |
+| `PASSWORD_RESET_TTL_MINUTES` | `30` | How long a mailed one-time password stays usable |
+| `PASSWORD_RESET_COOLDOWN_SECONDS` | `120` | Minimum gap between reset mails for one account |
 | `SMTP_HOST` / `SMTP_PORT` | — / `587` | SMTP relay |
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | — | Optional SMTP auth |
 | `SMTP_FROM` | — | From address (required to enable email) |
@@ -266,17 +374,18 @@ All `/api/*` routes except the three marked *public* require a session cookie
 | Method | Path | Access | Purpose |
 |---|---|---|---|
 | `GET` | `/api/health` | public | Liveness |
-| `POST` | `/api/auth/login` | public | Exchange credentials for a session |
+| `POST` | `/api/auth/login` | public | Exchange credentials for a session (email, or a legacy username) |
+| `POST` | `/api/auth/forgot` | public | Mail a one-time password; always answers `200` |
 | `GET` | `/api/auth/session` | public | Who am I (or `authenticated:false`) |
 | `POST` | `/api/auth/logout` | any | End this session |
 | `POST` | `/api/auth/password` | any | Change your own password |
 | `GET` | `/api/config` | any | Cutoffs, defaults, escalation ladder, limits |
 | `GET` | `/api/certificates` | any | List, enriched, most-urgent first (redacted unless owned) |
-| `POST` | `/api/certificates` | any | Create — you become the owner |
+| `POST` | `/api/certificates` | any | Create (`kind`: `certificate` \| `token`, default `certificate`) — you become the owner |
 | `GET` | `/api/certificates/{id}` | any | Read |
 | `PUT` | `/api/certificates/{id}` | owner/admin | Update (re-arms reminders if expiry changed) |
-| `DELETE` | `/api/certificates/{id}` | owner/admin | Soft delete |
-| `POST` | `/api/certificates/{id}/restore` | admin | Undo a soft delete |
+| `DELETE` | `/api/certificates/{id}` | — | Gone: answers `409` pointing at the deletion workflow |
+| `POST` | `/api/certificates/{id}/restore` | admin | Undo a soft delete (clears the recorded reason) |
 | `PUT` | `/api/certificates/{id}/owner` | owner/admin | Transfer ownership |
 | `POST` | `/api/certificates/{id}/test` | owner/admin | Send a test notification |
 | `GET` | `/api/certificates/{id}/audit` | owner/admin | History of one certificate |
@@ -287,11 +396,17 @@ All `/api/*` routes except the three marked *public* require a session cookie
 | `POST` | `/api/renewals/{id}/approve` | **not the submitter** | Approve — rotates and creates the replacement |
 | `POST` | `/api/renewals/{id}/reject` | **not the submitter** | Reject with a reason |
 | `POST` | `/api/renewals/{id}/withdraw` | submitter/admin | Cancel your own request |
+| `POST` | `/api/certificates/{id}/deletions` | owner/admin | Open a deletion request (`{"reason": "…"}`, required) |
+| `GET` | `/api/deletions` | any | List requests (`?status=`, `?certificate_id=`) |
+| `GET` | `/api/deletions/{id}` | any | Read one |
+| `POST` | `/api/deletions/{id}/approve` | **not the requester** | Approve — soft-deletes and notifies the channels |
+| `POST` | `/api/deletions/{id}/reject` | **not the requester** | Refuse with a reason |
+| `POST` | `/api/deletions/{id}/withdraw` | requester/admin | Cancel your own request |
 | `GET` | `/api/users` | any | Roster (emails hidden from non-admins) |
-| `POST` | `/api/users` | admin | Create an account |
+| `POST` | `/api/users` | admin | Create an account from an email address (handle is derived) |
 | `PUT` | `/api/users/{id}` | admin | Role, profile, disable |
-| `POST` | `/api/users/{id}/password` | admin | Reset a password |
-| `GET` | `/api/audit` | admin | Tracker-wide history (`?category=certificate\|rotation\|user\|auth\|system`) |
+| `POST` | `/api/users/{id}/password` | admin | Set a temporary password (holder must then replace it) |
+| `GET` | `/api/audit` | admin | Tracker-wide history (`?category=certificate\|rotation\|deletion\|user\|auth\|system`) |
 | `POST` | `/api/tasks/run-check` | admin | Run the reminder scan now |
 
 ## Local development

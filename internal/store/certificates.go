@@ -20,41 +20,44 @@ var (
 	ErrCertLocked = errors.New("certificate is rotated or deleted")
 )
 
-// certSelect reads a certificate plus the owner's username and the id of any
-// open renewal request. Kept as one string so every read path returns rows
-// that scanCert can consume.
+// certSelect reads a certificate plus the owner's username and the ids of any
+// open renewal / deletion request. Kept as one string so every read path
+// returns rows that scanCert can consume.
 const certSelect = `
-	SELECT c.id, c.name, c.environment, c.issued_date, c.expiry_date,
+	SELECT c.id, c.name, c.kind, c.environment, c.issued_date, c.expiry_date,
 	       c.reminder_days, c.teams_webhook_url, c.notify_emails, c.notes,
 	       c.created_at, c.updated_at,
-	       c.owner_id, COALESCE(u.username, ''), c.deleted_at, c.rotated_at,
-	       c.renewed_from_id, c.last_notified_on,
+	       c.owner_id, COALESCE(u.username, ''), c.deleted_at, c.deletion_reason,
+	       c.rotated_at, c.renewed_from_id, c.last_notified_on,
 	       (SELECT r.id FROM renewals r
-	         WHERE r.certificate_id = c.id AND r.status = 'pending_review' LIMIT 1)
+	         WHERE r.certificate_id = c.id AND r.status = 'pending_review' LIMIT 1),
+	       (SELECT d.id FROM deletion_requests d
+	         WHERE d.certificate_id = c.id AND d.status = 'pending_review' LIMIT 1)
 	  FROM certificates c
 	  LEFT JOIN users u ON u.id = c.owner_id`
 
 // certReturning is the RETURNING clause for writes. It cannot join, so the
-// owner username and pending-renewal id come back empty; write paths that
+// owner username and the pending-request ids come back empty; write paths that
 // need them re-read through certSelect.
 const certReturning = `
-	RETURNING id, name, environment, issued_date, expiry_date,
+	RETURNING id, name, kind, environment, issued_date, expiry_date,
 	          reminder_days, teams_webhook_url, notify_emails, notes,
 	          created_at, updated_at,
-	          owner_id, '', deleted_at, rotated_at, renewed_from_id, last_notified_on, NULL::bigint`
+	          owner_id, '', deleted_at, deletion_reason, rotated_at,
+	          renewed_from_id, last_notified_on, NULL::bigint, NULL::bigint`
 
 func scanCert(row rowScanner) (*models.Certificate, error) {
 	var c models.Certificate
 	var days pq.Int64Array
 	var emails pq.StringArray
-	var ownerID, renewedFrom, pendingRenewal sql.NullInt64
+	var ownerID, renewedFrom, pendingRenewal, pendingDeletion sql.NullInt64
 	var deletedAt, rotatedAt, lastNotified sql.NullTime
 
 	if err := row.Scan(
-		&c.ID, &c.Name, &c.Environment, &c.IssuedDate, &c.ExpiryDate,
+		&c.ID, &c.Name, &c.Kind, &c.Environment, &c.IssuedDate, &c.ExpiryDate,
 		&days, &c.TeamsWebhook, &emails, &c.Notes, &c.CreatedAt, &c.UpdatedAt,
-		&ownerID, &c.OwnerUsername, &deletedAt, &rotatedAt,
-		&renewedFrom, &lastNotified, &pendingRenewal,
+		&ownerID, &c.OwnerUsername, &deletedAt, &c.DeletionReason, &rotatedAt,
+		&renewedFrom, &lastNotified, &pendingRenewal, &pendingDeletion,
 	); err != nil {
 		return nil, err
 	}
@@ -66,6 +69,7 @@ func scanCert(row rowScanner) (*models.Certificate, error) {
 	c.OwnerID = nullInt(ownerID)
 	c.RenewedFromID = nullInt(renewedFrom)
 	c.PendingRenewalID = nullInt(pendingRenewal)
+	c.PendingDeletionID = nullInt(pendingDeletion)
 	c.DeletedAt = nullTime(deletedAt)
 	c.RotatedAt = nullTime(rotatedAt)
 	c.LastNotifiedOn = nullTime(lastNotified)
@@ -104,6 +108,17 @@ func fromInt64Slice(in pq.Int64Array) []int {
 		out[i] = int(v)
 	}
 	return out
+}
+
+// certKind reads the kind of one certificate inside a transaction. Audit rows
+// carry it so the log can be filtered by type without joining back to a row
+// that may since have been renamed or deleted.
+func certKind(tx *sql.Tx, id int64) string {
+	var kind string
+	if err := tx.QueryRow(`SELECT kind FROM certificates WHERE id=$1`, id).Scan(&kind); err != nil {
+		return models.KindCertificate
+	}
+	return kind
 }
 
 // ---------- reads ----------
@@ -161,10 +176,10 @@ func (s *Store) CreateCertificate(c *models.Certificate, actor Actor) (*models.C
 
 	created, err := scanCert(tx.QueryRow(
 		`INSERT INTO certificates
-		 (name, environment, issued_date, expiry_date, reminder_days,
+		 (name, kind, environment, issued_date, expiry_date, reminder_days,
 		  teams_webhook_url, notify_emails, notes, owner_id, renewed_from_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`+certReturning,
-		c.Name, c.Environment, c.IssuedDate, c.ExpiryDate,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`+certReturning,
+		c.Name, c.Kind, c.Environment, c.IssuedDate, c.ExpiryDate,
 		toInt64Slice(c.ReminderDays), c.TeamsWebhook, pq.StringArray(c.NotifyEmails),
 		c.Notes, actor.ID, c.RenewedFromID))
 	if err != nil {
@@ -173,6 +188,7 @@ func (s *Store) CreateCertificate(c *models.Certificate, actor Actor) (*models.C
 
 	if err := auditTx(tx, actor, ActionCertCreate, "certificate", &created.ID, map[string]any{
 		"name":        created.Name,
+		"kind":        created.Kind,
 		"environment": created.Environment,
 		"expiry_date": models.DateOnly(created.ExpiryDate),
 	}); err != nil {
@@ -252,6 +268,7 @@ func (s *Store) UpdateCertificate(c *models.Certificate, actor Actor, isAdmin bo
 
 	if err := auditTx(tx, actor, ActionCertUpdate, "certificate", &updated.ID, map[string]any{
 		"name":           updated.Name,
+		"kind":           updated.Kind,
 		"expiry_date":    models.DateOnly(updated.ExpiryDate),
 		"expiry_changed": !prevExpiry.Equal(updated.ExpiryDate),
 		"prev_expiry":    models.DateOnly(prevExpiry),
@@ -265,43 +282,6 @@ func (s *Store) UpdateCertificate(c *models.Certificate, actor Actor, isAdmin bo
 	return s.GetCertificate(updated.ID)
 }
 
-// DeleteCertificate soft-deletes: the row is hidden but recoverable, so an
-// accidental delete of someone's reminder configuration is not permanent.
-func (s *Store) DeleteCertificate(id int64, actor Actor, isAdmin bool) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := lockCertForWrite(tx, id, actor, isAdmin, false); err != nil {
-		return err
-	}
-
-	var name string
-	err = tx.QueryRow(
-		`UPDATE certificates SET deleted_at=now(), deleted_by=$1, updated_at=now()
-		  WHERE id=$2 AND deleted_at IS NULL RETURNING name`, actor.ID, id).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound // already deleted
-	}
-	if err != nil {
-		return err
-	}
-
-	// An open renewal request on a deleted cert can never be actioned.
-	if _, err := tx.Exec(
-		`UPDATE renewals SET status='withdrawn', review_note='certificate deleted'
-		  WHERE certificate_id=$1 AND status='pending_review'`, id); err != nil {
-		return err
-	}
-
-	if err := auditTx(tx, actor, ActionCertDelete, "certificate", &id, map[string]any{"name": name}); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // RestoreCertificate undoes a soft delete. Admin-only at the API layer.
 func (s *Store) RestoreCertificate(id int64, actor Actor) (*models.Certificate, error) {
 	tx, err := s.db.Begin()
@@ -312,7 +292,8 @@ func (s *Store) RestoreCertificate(id int64, actor Actor) (*models.Certificate, 
 
 	var name string
 	err = tx.QueryRow(
-		`UPDATE certificates SET deleted_at=NULL, deleted_by=NULL, updated_at=now()
+		`UPDATE certificates SET deleted_at=NULL, deleted_by=NULL, deletion_reason='',
+		        updated_at=now()
 		  WHERE id=$1 AND deleted_at IS NOT NULL RETURNING name`, id).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -320,7 +301,8 @@ func (s *Store) RestoreCertificate(id int64, actor Actor) (*models.Certificate, 
 	if err != nil {
 		return nil, err
 	}
-	if err := auditTx(tx, actor, ActionCertRestore, "certificate", &id, map[string]any{"name": name}); err != nil {
+	if err := auditTx(tx, actor, ActionCertRestore, "certificate", &id,
+		map[string]any{"name": name, "kind": certKind(tx, id)}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -363,7 +345,9 @@ func (s *Store) TransferOwner(id, newOwnerID int64, actor Actor, isAdmin bool) (
 		return nil, err
 	}
 
-	detail := map[string]any{"new_owner": newOwnerName, "new_owner_id": newOwnerID}
+	detail := map[string]any{
+		"new_owner": newOwnerName, "new_owner_id": newOwnerID, "kind": certKind(tx, id),
+	}
 	if prevOwner != nil {
 		detail["prev_owner_id"] = *prevOwner
 	}

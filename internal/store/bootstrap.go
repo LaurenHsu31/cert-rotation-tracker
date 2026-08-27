@@ -34,14 +34,18 @@ func (s *Store) Bootstrap(username, password string) (*BootstrapResult, error) {
 		if username == "" {
 			username = "admin"
 		}
+		generated := false
 		if password == "" {
 			password, err = generatePassword()
 			if err != nil {
 				return nil, err
 			}
 			res.GeneratedPassword = password
+			generated = true
 		}
-		u, err := s.CreateUser(username, "Administrator", "", password, models.RoleAdmin)
+		// A generated password is written to the startup log, so it is already
+		// disclosed — force it to be replaced at first sign-in.
+		u, err := s.CreateUser(username, "Administrator", "", password, models.RoleAdmin, generated)
 		if err != nil {
 			return nil, fmt.Errorf("create bootstrap admin: %w", err)
 		}

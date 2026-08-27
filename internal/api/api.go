@@ -58,6 +58,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", a.health)
 	mux.HandleFunc("POST /api/auth/login", a.login)
 	mux.HandleFunc("GET /api/auth/session", a.session)
+	mux.HandleFunc("POST /api/auth/forgot", a.forgotPassword)
 
 	// --- authenticated ---
 	signed := a.authed
@@ -82,6 +83,14 @@ func (a *API) Handler() http.Handler {
 	mux.Handle("POST /api/renewals/{id}/approve", signed(a.approveRenewal))
 	mux.Handle("POST /api/renewals/{id}/reject", signed(a.rejectRenewal))
 	mux.Handle("POST /api/renewals/{id}/withdraw", signed(a.withdrawRenewal))
+
+	// Deletion workflow — a reason plus a second person, then a notification.
+	mux.Handle("GET /api/deletions", signed(a.listDeletions))
+	mux.Handle("POST /api/certificates/{id}/deletions", signed(a.submitDeletion))
+	mux.Handle("GET /api/deletions/{id}", signed(a.getDeletion))
+	mux.Handle("POST /api/deletions/{id}/approve", signed(a.approveDeletion))
+	mux.Handle("POST /api/deletions/{id}/reject", signed(a.rejectDeletion))
+	mux.Handle("POST /api/deletions/{id}/withdraw", signed(a.withdrawDeletion))
 
 	mux.Handle("GET /api/users", signed(a.listUsers))
 
@@ -111,14 +120,43 @@ func (a *API) authed(h http.HandlerFunc) http.Handler {
 		if !ok {
 			return
 		}
+		if !a.passwordCurrent(w, r, id) {
+			return
+		}
 		h(w, r.WithContext(auth.WithIdentity(r.Context(), id)))
 	})
+}
+
+// passwordChangeExempt are the only routes an account holding a one-time
+// password may reach. Signing out has to work (otherwise a wrong address
+// strands the browser), and setting a new password is the whole point.
+var passwordChangeExempt = map[string]bool{
+	"/api/auth/password": true,
+	"/api/auth/logout":   true,
+	"/api/config":        true,
+}
+
+// passwordCurrent freezes an account that is still on a temporary password.
+// Enforcing it here rather than per-handler is what makes it airtight: a route
+// added later is covered by default, and has to be listed explicitly to escape.
+func (a *API) passwordCurrent(w http.ResponseWriter, r *http.Request, id *auth.Identity) bool {
+	if !id.MustChangePassword || passwordChangeExempt[r.URL.Path] {
+		return true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"error": "Choose a new password before using the tracker",
+		"code":  "password_change_required",
+	})
+	return false
 }
 
 func (a *API) adminOnly(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, ok := a.identify(w, r)
 		if !ok {
+			return
+		}
+		if !a.passwordCurrent(w, r, id) {
 			return
 		}
 		if !id.IsAdmin() {
@@ -158,7 +196,10 @@ func (a *API) identify(w http.ResponseWriter, r *http.Request) (*auth.Identity, 
 	if err := a.store.TouchSession(token, a.cfg.SessionTTL); err != nil {
 		a.log.Warn("touch session", "error", err)
 	}
-	return &auth.Identity{UserID: u.ID, Username: u.Username, Role: u.Role}, true
+	return &auth.Identity{
+		UserID: u.ID, Username: u.Username, Role: u.Role,
+		MustChangePassword: u.MustChangePassword,
+	}, true
 }
 
 // checkOrigin is the CSRF defence for cookie-authenticated, state-changing
@@ -224,6 +265,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"app_env":               a.cfg.AppEnv,
 		"environments":          []string{models.EnvDev, models.EnvStg, models.EnvPrd},
+		"kinds":                 []string{models.KindCertificate, models.KindToken},
 		"reminder_default_days": a.cfg.ReminderDefaultDays,
 		"reminder_options":      []int{30, 45, 60, 75, 90},
 		"reminder_escalation":   a.cfg.ReminderEscalation,
@@ -233,10 +275,11 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 			"urgent":   a.cfg.SeverityUrgentDays,
 			"critical": a.cfg.SeverityCriticalDays,
 		},
-		"audit_categories": store.AuditCategories,
-		"email_enabled":    a.cfg.EmailEnabled(),
-		"auth_enabled":     a.cfg.AuthEnabled,
-		"max_upload_bytes": a.cfg.MaxUploadBytes,
+		"audit_categories":       store.AuditCategories,
+		"email_enabled":          a.cfg.EmailEnabled(),
+		"password_reset_minutes": int(a.cfg.PasswordResetTTL.Minutes()),
+		"auth_enabled":           a.cfg.AuthEnabled,
+		"max_upload_bytes":       a.cfg.MaxUploadBytes,
 	})
 }
 
@@ -274,6 +317,16 @@ func (a *API) storeError(w http.ResponseWriter, op string, err error) {
 		writeError(w, http.StatusConflict, store.ErrRenewalOpen.Error())
 	case errors.Is(err, store.ErrSelfReview):
 		writeError(w, http.StatusForbidden, store.ErrSelfReview.Error())
+	case errors.Is(err, store.ErrDeletionNotFound):
+		writeError(w, http.StatusNotFound, "Deletion request not found")
+	case errors.Is(err, store.ErrDeletionNotOpen):
+		writeError(w, http.StatusConflict, "This deletion request has already been actioned")
+	case errors.Is(err, store.ErrDeletionOpen):
+		writeError(w, http.StatusConflict, store.ErrDeletionOpen.Error())
+	case errors.Is(err, store.ErrSelfDeleteReview):
+		writeError(w, http.StatusForbidden, store.ErrSelfDeleteReview.Error())
+	case errors.Is(err, store.ErrNoReason):
+		writeError(w, http.StatusBadRequest, "A reason for the deletion is required")
 	case errors.Is(err, store.ErrNoEvidence):
 		writeError(w, http.StatusBadRequest, "Attach the new certificate as proof")
 	case errors.Is(err, store.ErrUserNotFound):
@@ -282,6 +335,8 @@ func (a *API) storeError(w http.ResponseWriter, op string, err error) {
 		writeError(w, http.StatusBadRequest, "That account is disabled")
 	case errors.Is(err, store.ErrUserExists):
 		writeError(w, http.StatusConflict, "That username is already taken")
+	case errors.Is(err, store.ErrEmailExists):
+		writeError(w, http.StatusConflict, store.ErrEmailExists.Error())
 	case errors.Is(err, store.ErrLastAdmin):
 		writeError(w, http.StatusConflict,
 			"There must always be at least one active administrator")
