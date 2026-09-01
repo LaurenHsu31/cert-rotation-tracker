@@ -267,7 +267,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 		"environments":          []string{models.EnvDev, models.EnvStg, models.EnvPrd},
 		"kinds":                 []string{models.KindCertificate, models.KindToken},
 		"reminder_default_days": a.cfg.ReminderDefaultDays,
-		"reminder_options":      []int{30, 45, 60, 75, 90},
+		"reminder_options":      []int{10, 30, 45, 60, 75, 90},
 		"reminder_escalation":   a.cfg.ReminderEscalation,
 		"severity_cutoffs": map[string]int{
 			"notice":   a.cfg.SeverityNoticeDays,

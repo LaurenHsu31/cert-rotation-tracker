@@ -355,17 +355,25 @@ func parseDateRange(issuedStr, expiryStr string) (time.Time, time.Time, error) {
 	return issued, expiry, nil
 }
 
+// normalizeDays de-duplicates and sorts the milestone list.
+//
+// An absent field and an empty one mean different things, and JSON lets us tell
+// them apart: `reminder_days` omitted leaves `in` nil and falls back to the
+// deployment default, while an explicit `[]` is a real choice — no milestones,
+// rely on the escalation cadence alone — and is preserved. Without that
+// distinction, unticking every milestone in the form would silently hand back
+// whatever the default happened to be.
 func normalizeDays(in, def []int) []int {
+	if in == nil {
+		in = def
+	}
 	seen := map[int]bool{}
-	var out []int
+	out := []int{}
 	for _, d := range in {
 		if d > 0 && !seen[d] {
 			seen[d] = true
 			out = append(out, d)
 		}
-	}
-	if len(out) == 0 {
-		out = append(out, def...)
 	}
 	sort.Ints(out)
 	return out

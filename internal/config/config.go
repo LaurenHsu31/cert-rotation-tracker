@@ -87,7 +87,11 @@ func Load() (*Config, error) {
 		SeverityUrgentDays:   getInt("SEVERITY_URGENT_DAYS", 30),
 		SeverityCriticalDays: getInt("SEVERITY_CRITICAL_DAYS", 7),
 
-		ReminderDefaultDays: getIntSlice("REMINDER_DEFAULT_DAYS", []int{30, 45, 60, 75, 90}),
+		// Empty by default: the Add form starts with nothing ticked so the
+		// person adding a certificate makes a deliberate choice rather than
+		// inheriting five milestones they never looked at. A deployment that
+		// wants a house standard can still set this and have it pre-selected.
+		ReminderDefaultDays: getIntSlice("REMINDER_DEFAULT_DAYS", []int{}),
 
 		AuthEnabled: getBool("AUTH_ENABLED", true),
 		SessionTTL:  time.Duration(getInt("SESSION_TTL_HOURS", 12)) * time.Hour,

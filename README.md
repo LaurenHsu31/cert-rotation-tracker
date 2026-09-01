@@ -102,14 +102,17 @@ docker compose --profile mailtest up --build
 
 Three independent concepts:
 
-- **Milestones** (per certificate, e.g. `30, 45, 60, 75, 90`) each fire **once**,
-  the first scan after days-remaining drops to or below them.
+- **Milestones** (per certificate, chosen from `10, 30, 45, 60, 75, 90`) each fire **once**,
+  the first scan after days-remaining drops to or below them. Nothing is
+  pre-ticked — picking none is a valid choice, and leaves the cadence below as
+  the only trigger.
 - **Escalation cadence** (`REMINDER_ESCALATION`, tracker-wide) then **repeats**
   the alert on an interval that shortens as expiry approaches.
 - **Severity** (`healthy → notice → warning → urgent → critical → expired`) decides
   how each certificate *looks*, derived from configurable day cutoffs.
 
-The default ladder, reading top to bottom as a certificate ages:
+The ladder for a certificate that has every milestone ticked, reading top to
+bottom as it ages:
 
 | Days remaining | What fires |
 |---|---|
@@ -347,7 +350,7 @@ port 587 negotiates STARTTLS automatically.
 | `SEVERITY_WARNING_DAYS` | `60` | ≤ this ⇒ warning |
 | `SEVERITY_URGENT_DAYS` | `30` | ≤ this ⇒ urgent |
 | `SEVERITY_CRITICAL_DAYS` | `7` | ≤ this ⇒ critical |
-| `REMINDER_DEFAULT_DAYS` | `30,45,60,75,90` | Default milestones in the form |
+| `REMINDER_DEFAULT_DAYS` | *(empty)* | Milestones pre-ticked in the Add form; blank means the person choosing picks them |
 | `REMINDER_ESCALATION` | `45:5,30:3,10:1` | Repeat ladder, `within_days:every_days` |
 | `AUTH_ENABLED` | `true` | `false` runs everything as the bootstrap admin (dev only) |
 | `SESSION_TTL_HOURS` | `12` | Sliding session lifetime |

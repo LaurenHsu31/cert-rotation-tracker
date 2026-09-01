@@ -261,7 +261,7 @@ createApp({
         environment: "prd",
         issued_date: todayStr(),
         expiry_date: "",
-        reminder_days: [30, 45, 60, 75, 90],
+        reminder_days: [],
         teams_webhook_url: "",
         emails_text: "",
         notes: "",
@@ -274,7 +274,7 @@ createApp({
     );
     const kinds = computed(() => (config.value && config.value.kinds) || ["certificate", "token"]);
     const reminderOptions = computed(() =>
-      config.value ? config.value.reminder_options : [30, 45, 60, 75, 90]
+      config.value ? config.value.reminder_options : [10, 30, 45, 60, 75, 90]
     );
     const emailEnabled = computed(() => (config.value ? config.value.email_enabled : false));
     const escalation = computed(() => (config.value && config.value.reminder_escalation) || []);
@@ -1842,7 +1842,9 @@ createApp({
             <button v-for="d in reminderOptions" :key="d" type="button"
               :class="{ on: form.reminder_days.includes(d) }" @click="toggleDay(d)">{{ d }}d</button>
           </div>
-          <span class="hint">One alert per milestone as the deadline approaches.</span>
+          <span v-if="form.reminder_days.length" class="hint">One alert per milestone as the deadline approaches.</span>
+          <span v-else class="hint">None picked — no milestone alerts. It still escalates on the
+            schedule below once expiry gets close, so it will not go unwatched.</span>
           <div v-if="escalation.length" class="escalation-note">
             <strong>Then it escalates automatically:</strong>
             <span v-for="(r, i) in escalation" :key="r.within_days">
